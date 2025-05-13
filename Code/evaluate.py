@@ -255,20 +255,21 @@ def main(args):
     # Set deterministic behavior for reproducibility
     set_determinism(seed=args.seed)
     
-    # Check if CUDA is available
-    if torch.cuda.is_available() and not args.no_cuda:
+    # Device selection - use CUDA if available and not explicitly disabled
+    if not args.no_cuda and torch.cuda.is_available():
         device = torch.device("cuda")
-        print("Using GPU:", torch.cuda.get_device_name(0))
+        print(f"Using CUDA - GPU: {torch.cuda.get_device_name(0)}")
     else:
         device = torch.device("cpu")
-        print("Using CPU")
+        print("Using CPU (CUDA not available or disabled)")
     
     # Prepare datasets and data loaders
     print("Preparing dataset...")
     _, _, test_loader = prepare_ribfrac_dataset(
         data_dir=args.data_dir,
         batch_size=args.batch_size,
-        cache_rate=args.cache_rate
+        cache_rate=args.cache_rate,
+        num_workers=args.num_workers
     )
     
     # Create model
@@ -283,7 +284,7 @@ def main(args):
     print(f"Loading model from {args.checkpoint_path}...")
     model = load_model(args.checkpoint_path, model, device)
     
-    # Create output directory
+    # Create output directory if it doesn't exist
     os.makedirs(args.output_dir, exist_ok=True)
     
     # Evaluate model
@@ -306,6 +307,7 @@ if __name__ == "__main__":
     parser.add_argument("--cache_rate", type=float, default=1.0, help="Cache rate for dataset")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no_cuda", action="store_true", help="Disable CUDA")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for dataset preparation")
     
     args = parser.parse_args()
     

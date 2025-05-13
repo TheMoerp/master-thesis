@@ -19,7 +19,7 @@ from monai.utils import set_determinism
 import SimpleITK as sitk
 import pandas as pd
 
-def prepare_ribfrac_dataset(data_dir="datasets", output_dir=None, cache_rate=0.0, batch_size=2):
+def prepare_ribfrac_dataset(data_dir="datasets", output_dir=None, cache_rate=0.0, batch_size=2, num_workers=2):
     """
     Prepare the RibFrac dataset for training using MONAI transforms.
     
@@ -28,6 +28,7 @@ def prepare_ribfrac_dataset(data_dir="datasets", output_dir=None, cache_rate=0.0
         output_dir: Optional directory to save processed data
         cache_rate: Cache rate for MONAI CacheDataset
         batch_size: Batch size for DataLoader
+        num_workers: Number of workers for DataLoader
         
     Returns:
         train_loader, val_loader, test_loader: DataLoaders for training, validation and testing
@@ -38,7 +39,7 @@ def prepare_ribfrac_dataset(data_dir="datasets", output_dir=None, cache_rate=0.0
     images_dir = os.path.join(data_dir, "Images")
     labels_dir = os.path.join(data_dir, "Labels")
     
-    # Get all image files with the correct pattern
+    # Get all image files with the correct pattern - using os.path.join for Windows compatibility
     all_images = sorted(glob.glob(os.path.join(images_dir, "RibFrac*-image.nii.gz")))
     all_labels = sorted(glob.glob(os.path.join(labels_dir, "RibFrac*-label.nii.gz")))
     
@@ -132,30 +133,30 @@ def prepare_ribfrac_dataset(data_dir="datasets", output_dir=None, cache_rate=0.0
     train_ds = CacheDataset(
         data=train_files,
         transform=train_transforms,
-        cache_rate=cache_rate,  # Reduced cache rate to save memory
-        num_workers=2  # Reduced number of workers
+        cache_rate=cache_rate,
+        num_workers=num_workers
     )
     
     val_ds = CacheDataset(
         data=val_files,
         transform=val_transforms,
         cache_rate=cache_rate,
-        num_workers=2
+        num_workers=num_workers
     )
     
     test_ds = CacheDataset(
         data=test_files,
         transform=val_transforms,
         cache_rate=cache_rate,
-        num_workers=2
+        num_workers=num_workers
     )
     
-    # Create data loaders with reduced batch size and workers
+    # Create data loaders
     train_loader = DataLoader(
         train_ds, 
         batch_size=batch_size, 
         shuffle=True, 
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=True
     )
     
@@ -163,7 +164,7 @@ def prepare_ribfrac_dataset(data_dir="datasets", output_dir=None, cache_rate=0.0
         val_ds, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=True
     )
     
@@ -171,7 +172,7 @@ def prepare_ribfrac_dataset(data_dir="datasets", output_dir=None, cache_rate=0.0
         test_ds, 
         batch_size=batch_size, 
         shuffle=False, 
-        num_workers=2,
+        num_workers=num_workers,
         pin_memory=True
     )
     
@@ -182,7 +183,8 @@ if __name__ == "__main__":
     try:
         train_loader, val_loader, test_loader = prepare_ribfrac_dataset(
             batch_size=1,  # Minimal batch size
-            cache_rate=0.0  # No caching
+            cache_rate=0.0,  # No caching
+            num_workers=2  # Increased number of workers
         )
         
         print("\nDataset loading successful!")

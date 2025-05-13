@@ -47,7 +47,7 @@ def train_model(
     # Define loss function and optimizer
     criterion = nn.MSELoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     
     # Training history
     history = {
@@ -186,16 +186,21 @@ def main(args):
     # Set deterministic behavior for reproducibility
     set_determinism(seed=args.seed)
     
-    # For now, use CPU as Conv3D is not supported on MPS
-    device = torch.device("cpu")
-    print("Using CPU (Conv3D operations are not yet supported on MPS)")
+    # Device selection - use CUDA if available and not explicitly disabled
+    if not args.no_cuda and torch.cuda.is_available():
+        device = torch.device("cuda")
+        print(f"Using CUDA - GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        device = torch.device("cpu")
+        print("Using CPU (CUDA not available or disabled)")
     
     # Prepare datasets and data loaders
     print("Preparing dataset...")
     train_loader, val_loader, test_loader = prepare_ribfrac_dataset(
-        data_dir="datasets",
+        data_dir=args.data_dir,
         batch_size=args.batch_size,
-        cache_rate=0.0
+        cache_rate=args.cache_rate,
+        num_workers=args.num_workers
     )
     
     # Create model
@@ -258,7 +263,12 @@ if __name__ == "__main__":
                       help="Disable CUDA training")
     parser.add_argument("--checkpoint_dir", type=str, default="checkpoints",
                       help="Directory to save checkpoints")
-    parser.add_argument("--threshold_percentile", type=float, default=95, help="Percentile for anomaly threshold")
+    parser.add_argument("--threshold_percentile", type=float, default=95, 
+                      help="Percentile for anomaly threshold")
+    parser.add_argument("--cache_rate", type=float, default=0.0,
+                      help="Cache rate for MONAI CacheDataset (0.0-1.0)")
+    parser.add_argument("--num_workers", type=int, default=2,
+                      help="Number of workers for data loading")
     
     args = parser.parse_args()
     main(args) 

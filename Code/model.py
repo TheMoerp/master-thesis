@@ -182,14 +182,18 @@ class AnomalyDetector:
         self.threshold_percentile = threshold_percentile
         self.threshold = None
     
-    def calibrate(self, val_loader, device='cuda'):
+    def calibrate(self, val_loader, device=None):
         """
         Calibrate the anomaly threshold based on validation data.
         
         Args:
             val_loader: Validation data loader with normal samples
-            device: Device to use for computation
+            device: Device to use for computation. If None, uses cuda if available, otherwise cpu.
         """
+        # Determine device if not provided
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            
         self.model.eval()
         error_scores = []
         
@@ -209,19 +213,23 @@ class AnomalyDetector:
         
         return self.threshold
     
-    def detect(self, images, device='cuda'):
+    def detect(self, images, device=None):
         """
         Detect anomalies in images.
         
         Args:
             images: Input images tensor
-            device: Device to use for computation
+            device: Device to use for computation. If None, uses cuda if available, otherwise cpu.
             
         Returns:
             is_anomaly: Boolean tensor indicating whether each image is an anomaly
             error_map: Pixel-wise error map
             error_score: Overall error score
         """
+        # Determine device if not provided
+        if device is None:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+            
         self.model.eval()
         
         with torch.no_grad():

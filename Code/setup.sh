@@ -73,23 +73,23 @@ if [ "$answer" != "${answer#[Yy]}" ]; then
     # Setze Umgebungsvariable für reduzierte Parallelität
     export MONAI_DATA_LOADER_NUM_WORKERS=1
     # Führe Test mit reduziertem Batch-Size aus
-    python3 -c "
-import sys
-sys.path.append('.')
-from data_preparation import prepare_ribfrac_dataset
-try:
-    train_loader, val_loader, test_loader = prepare_ribfrac_dataset(batch_size=1, cache_rate=0.0)
-    print('Dataset loading successful!')
-    print(f'Number of training batches: {len(train_loader)}')
-    print(f'Number of validation batches: {len(val_loader)}')
-    print(f'Number of testing batches: {len(test_loader)}')
-except Exception as e:
-    print(f'Error loading dataset: {str(e)}')
+    python3 -c "\\n\
+import sys\\n\
+sys.path.append(\'.\')\\n\
+from data_preparation import prepare_ribfrac_dataset\\n\
+try:\\n\
+    train_loader, val_loader, test_loader = prepare_ribfrac_dataset(batch_size=1, cache_rate=0.0)\\n\
+    print(\\\'Dataset loading successful!\\\')\\n\
+    print(f\\\'Number of training batches: {len(train_loader)}\\\')\\n\
+    print(f\\\'Number of validation batches: {len(val_loader)}\\\')\\n\
+    print(f\\\'Number of testing batches: {len(test_loader)}\\\')\\n\
+except Exception as e:\\n\
+    print(f\\\'Error loading dataset: {str(e)}\\\')\\n\
 "
 fi
 
 # Deaktiviere die virtuelle Umgebung
-deactivate
+# deactivate # This line is commented out / removed
 
 echo -e "${GREEN}Setup process completed!${NC}"
 echo -e "${BLUE}You can now activate the environment with:${NC}"
