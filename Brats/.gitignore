@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+*.pth
+*.pt
+*.pth.tar
+*.pth.tar.gz
+datasets/
+BraTS*

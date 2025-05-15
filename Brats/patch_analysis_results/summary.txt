@@ -1,0 +1,19 @@
+Total patients analyzed: 1251
+Total patches: 490392
+Normal patches: 460641 (93.9%)
+Tumor patches: 29751 (6.1%)
+Ratio of normal to tumor patches: 15.48
+
+Patients with highest percentage of normal patches:
+  BraTS-GLI-01341-000: 99.7% normal patches
+  BraTS-GLI-00732-001: 99.7% normal patches
+  BraTS-GLI-00753-001: 99.5% normal patches
+  BraTS-GLI-01333-000: 99.5% normal patches
+  BraTS-GLI-01077-000: 99.5% normal patches
+
+Patients with lowest percentage of normal patches:
+  BraTS-GLI-01320-000: 86.0% normal patches
+  BraTS-GLI-00568-000: 85.7% normal patches
+  BraTS-GLI-01430-000: 85.7% normal patches
+  BraTS-GLI-01498-000: 85.2% normal patches
+  BraTS-GLI-01533-000: 83.2% normal patches
