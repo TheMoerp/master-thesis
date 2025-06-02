@@ -1,1162 +1,793 @@
 #!/usr/bin/env python3
 """
-3D Autoencoder for Anomaly Detection on BraTS Dataset
-=====================================================
+Autoencoder-based Anomaly Detection for 3D BRATS Dataset
+========================================================
 
-This program implements a 3D convolutional autoencoder for anomaly detection
-on the BraTS dataset. It extracts normal patches (without tumor information)
-for training and evaluates the model's ability to detect anomalies.
+This script implements an autoencoder for anomaly detection on the BRATS dataset.
+Since BRATS contains only abnormal data, healthy 3D patches are extracted from
+abnormal volumes to serve as training data.
 
-Features:
-- 3D patch extraction from BraTS volumes
-- GPU acceleration for all compute-intensive operations
-- Real progress bars (no step-style)
-- Comprehensive evaluation metrics
-- Multiple visualization options
-- Configurable parameters via command line arguments
-
-Author: AI Assistant
+Usage: python ae_brats2.py --subjects <number_of_subjects>
 """
 
 import argparse
 import os
-import sys
-import logging
-import random
-import warnings
-from pathlib import Path
-from typing import List, Tuple, Dict, Optional, Union
-import time
-
+import glob
 import numpy as np
-import nibabel as nib
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tqdm import tqdm
-import pandas as pd
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader, random_split
-import torch.nn.functional as F
-
+from pathlib import Path
+import nibabel as nib
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, accuracy_score,
     precision_score, recall_score, f1_score, confusion_matrix,
     roc_curve, precision_recall_curve
 )
-from sklearn.manifold import TSNE
-from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-
-# Suppress warnings
+import warnings
 warnings.filterwarnings('ignore')
 
-# Set up logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('ae_brats2.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
-logger = logging.getLogger(__name__)
+# Try PyTorch first, fallback to TensorFlow
+try:
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.utils.data import Dataset, DataLoader
+    import torch.nn.functional as F
+    from tqdm import tqdm
+    FRAMEWORK = 'pytorch'
+    print("Using PyTorch")
+except ImportError:
+    try:
+        import tensorflow as tf
+        from tensorflow import keras
+        from tensorflow.keras import layers
+        FRAMEWORK = 'tensorflow'
+        print("Using TensorFlow")
+        # Enable GPU memory growth
+        gpus = tf.config.experimental.list_physical_devices('GPU')
+        if gpus:
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+    except ImportError:
+        raise ImportError("Neither PyTorch nor TensorFlow is available!")
 
 
-class Config:
-    """Configuration class for all parameters"""
+class BRATSDataProcessor:
+    """Handles BRATS data loading and preprocessing"""
     
-    def __init__(self, args):
-        # Dataset parameters
-        self.dataset_path = args.dataset_path
-        self.num_subjects = args.num_subjects
-        self.patch_size = args.patch_size
-        self.patches_per_volume = args.patches_per_volume
-        self.train_ratio = args.train_ratio
+    def __init__(self, data_path=".", patch_size=(32, 32, 32), stride=16):
+        self.data_path = Path(data_path)
+        self.patch_size = patch_size
+        self.stride = stride
+        self.healthy_patches = []
+        self.abnormal_patches = []
         
-        # Model parameters
-        self.latent_dim = args.latent_dim
-        self.learning_rate = args.learning_rate
-        self.batch_size = args.batch_size
-        self.epochs = args.epochs
-        self.weight_decay = args.weight_decay
+    def find_brats_files(self, max_subjects=None):
+        """Find BRATS NIfTI files"""
+        patterns = [
+            "**/BraTS*/*_t1.nii*",
+            "**/BraTS*/*_flair.nii*", 
+            "**/*_t1.nii*",
+            "**/*_flair.nii*",
+            "**/t1.nii*",
+            "**/flair.nii*"
+        ]
         
-        # Training parameters
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.num_workers = args.num_workers
-        self.seed = args.seed
+        files = []
+        for pattern in patterns:
+            found = list(self.data_path.glob(pattern))
+            files.extend(found)
+            if files:
+                break
         
-        # Output parameters
-        self.output_dir = args.output_dir
-        self.save_model = args.save_model
-        self.visualize = args.visualize
+        if not files:
+            # Try current directory
+            files = list(Path(".").glob("*.nii*"))
         
-        # Anomaly detection parameters
-        self.anomaly_threshold_percentile = args.anomaly_threshold_percentile
-
-
-class BraTSDataset(Dataset):
-    """Dataset class for BraTS 3D patches"""
+        if max_subjects:
+            files = files[:max_subjects]
+            
+        print(f"Found {len(files)} BRATS files")
+        return files
     
-    def __init__(self, patches: np.ndarray, labels: np.ndarray = None, transform=None):
-        """
-        Args:
-            patches: Array of 3D patches [N, C, D, H, W]
-            labels: Array of labels (0=normal, 1=anomaly)
-            transform: Optional transform to be applied
-        """
-        self.patches = torch.FloatTensor(patches)
-        self.labels = torch.LongTensor(labels) if labels is not None else None
-        self.transform = transform
-        
-    def __len__(self):
-        return len(self.patches)
+    def load_nifti(self, filepath):
+        """Load NIfTI file"""
+        try:
+            img = nib.load(str(filepath))
+            data = img.get_fdata()
+            return data
+        except Exception as e:
+            print(f"Error loading {filepath}: {e}")
+            return None
     
-    def __getitem__(self, idx):
-        patch = self.patches[idx]
-        
-        if self.transform:
-            patch = self.transform(patch)
-            
-        if self.labels is not None:
-            return patch, self.labels[idx]
-        return patch
-
-
-class Autoencoder3D(nn.Module):
-    """3D Convolutional Autoencoder"""
-    
-    def __init__(self, input_channels=4, latent_dim=128):
-        super(Autoencoder3D, self).__init__()
-        
-        self.input_channels = input_channels
-        self.latent_dim = latent_dim
-        
-        # Encoder
-        self.encoder = nn.Sequential(
-            # First conv block
-            nn.Conv3d(input_channels, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm3d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
-            
-            # Second conv block
-            nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
-            
-            # Third conv block
-            nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
-            
-            # Fourth conv block
-            nn.Conv3d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm3d(256),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool3d((2, 2, 2))
-        )
-        
-        # Latent space
-        self.fc_encode = nn.Linear(256 * 2 * 2 * 2, latent_dim)
-        self.fc_decode = nn.Linear(latent_dim, 256 * 2 * 2 * 2)
-        
-        # Decoder
-        self.decoder = nn.Sequential(
-            # First deconv block
-            nn.ConvTranspose3d(256, 128, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.BatchNorm3d(128),
-            nn.ReLU(inplace=True),
-            
-            # Second deconv block
-            nn.ConvTranspose3d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.BatchNorm3d(64),
-            nn.ReLU(inplace=True),
-            
-            # Third deconv block
-            nn.ConvTranspose3d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1),
-            nn.BatchNorm3d(32),
-            nn.ReLU(inplace=True),
-            
-            # Output layer
-            nn.Conv3d(32, input_channels, kernel_size=3, stride=1, padding=1),
-            nn.Sigmoid()
-        )
-        
-    def encode(self, x):
-        """Encode input to latent space"""
-        x = self.encoder(x)
-        x = x.view(x.size(0), -1)
-        return self.fc_encode(x)
-    
-    def decode(self, z):
-        """Decode from latent space"""
-        x = self.fc_decode(z)
-        x = x.view(x.size(0), 256, 2, 2, 2)
-        return self.decoder(x)
-    
-    def forward(self, x):
-        """Forward pass through autoencoder"""
-        z = self.encode(x)
-        return self.decode(z), z
-
-
-class BraTSDataProcessor:
-    """Class for processing BraTS data and extracting patches"""
-    
-    def __init__(self, config: Config):
-        self.config = config
-        self.subjects = []
-        self.patches = []
-        self.patch_labels = []
-        
-    def load_subjects(self) -> List[str]:
-        """Load list of available subjects"""
-        dataset_path = Path(self.config.dataset_path)
-        if not dataset_path.exists():
-            raise FileNotFoundError(f"Dataset path not found: {dataset_path}")
-            
-        subjects = []
-        for subject_dir in dataset_path.iterdir():
-            if subject_dir.is_dir() and subject_dir.name.startswith('BraTS-GLI-'):
-                subjects.append(subject_dir.name)
-                
-        subjects.sort()
-        logger.info(f"Found {len(subjects)} subjects in dataset")
-        
-        if self.config.num_subjects > 0:
-            subjects = subjects[:self.config.num_subjects]
-            logger.info(f"Using {len(subjects)} subjects as requested")
-            
-        return subjects
-    
-    def load_volume(self, subject_id: str) -> Tuple[np.ndarray, np.ndarray]:
-        """Load all modalities and segmentation for a subject"""
-        subject_path = Path(self.config.dataset_path) / subject_id
-        
-        # Load all modalities
-        modalities = ['t1n', 't1c', 't2w', 't2f']
-        volumes = []
-        
-        for modality in modalities:
-            file_path = subject_path / f"{subject_id}-{modality}.nii.gz"
-            if not file_path.exists():
-                raise FileNotFoundError(f"File not found: {file_path}")
-                
-            nii = nib.load(str(file_path))
-            volume = nii.get_fdata().astype(np.float32)
-            
-            # Normalize volume
-            volume = self.normalize_volume(volume)
-            volumes.append(volume)
-        
-        # Stack modalities
-        multi_modal_volume = np.stack(volumes, axis=0)  # Shape: [4, H, W, D]
-        
-        # Load segmentation
-        seg_path = subject_path / f"{subject_id}-seg.nii.gz"
-        if seg_path.exists():
-            seg_nii = nib.load(str(seg_path))
-            segmentation = seg_nii.get_fdata().astype(np.uint8)
-        else:
-            logger.warning(f"No segmentation found for {subject_id}")
-            segmentation = np.zeros(multi_modal_volume.shape[1:], dtype=np.uint8)
-            
-        return multi_modal_volume, segmentation
-    
-    def normalize_volume(self, volume: np.ndarray) -> np.ndarray:
+    def normalize_volume(self, volume):
         """Normalize volume to [0, 1] range"""
-        # Remove background (assuming 0 is background)
-        mask = volume > 0
-        if mask.sum() > 0:
-            volume_masked = volume[mask]
-            # Normalize to 0-1 using percentiles to handle outliers
-            p1, p99 = np.percentile(volume_masked, [1, 99])
-            volume = np.clip(volume, p1, p99)
-            volume = (volume - p1) / (p99 - p1)
-        
+        volume = volume.astype(np.float32)
+        if volume.max() > volume.min():
+            volume = (volume - volume.min()) / (volume.max() - volume.min())
         return volume
     
-    def extract_normal_patches(self, volume: np.ndarray, segmentation: np.ndarray) -> List[np.ndarray]:
-        """Extract patches that don't contain tumor information"""
+    def extract_patches_3d(self, volume, patch_size, stride):
+        """Extract 3D patches from volume"""
         patches = []
-        patch_size = self.config.patch_size
+        d, h, w = volume.shape
+        pd, ph, pw = patch_size
         
-        # Get volume dimensions
-        _, h, w, d = volume.shape
+        for z in range(0, d - pd + 1, stride):
+            for y in range(0, h - ph + 1, stride):
+                for x in range(0, w - pw + 1, stride):
+                    patch = volume[z:z+pd, y:y+ph, x:x+pw]
+                    if patch.shape == patch_size:
+                        patches.append(patch)
         
-        # Calculate valid patch positions
-        max_attempts = self.config.patches_per_volume * 10  # Try more to find normal patches
-        attempts = 0
-        
-        while len(patches) < self.config.patches_per_volume and attempts < max_attempts:
-            # Random patch position
-            x = random.randint(0, max(0, h - patch_size))
-            y = random.randint(0, max(0, w - patch_size))
-            z = random.randint(0, max(0, d - patch_size))
-            
-            # Extract patch from segmentation
-            seg_patch = segmentation[x:x+patch_size, y:y+patch_size, z:z+patch_size]
-            
-            # Check if patch contains tumor (any non-zero value in segmentation)
-            if seg_patch.sum() == 0:  # No tumor in this patch
-                # Extract corresponding volume patch
-                volume_patch = volume[:, x:x+patch_size, y:y+patch_size, z:z+patch_size]
-                
-                # Check if patch has enough non-zero voxels (not just background)
-                if np.mean(volume_patch > 0) > 0.1:  # At least 10% non-background
-                    patches.append(volume_patch)
-            
-            attempts += 1
-        
-        if len(patches) < self.config.patches_per_volume:
-            logger.warning(f"Could only extract {len(patches)} normal patches "
-                         f"(requested {self.config.patches_per_volume})")
-        
-        return patches
+        return np.array(patches)
     
-    def extract_anomaly_patches(self, volume: np.ndarray, segmentation: np.ndarray) -> List[np.ndarray]:
-        """Extract patches that contain tumor information"""
-        patches = []
-        patch_size = self.config.patch_size
+    def is_healthy_patch(self, patch, threshold=0.02):
+        """Determine if patch is healthy based on intensity variance"""
+        # Healthy patches should have low variance (uniform tissue)
+        # and moderate mean intensity (not background, not extreme lesion)
+        mean_intensity = np.mean(patch)
+        std_intensity = np.std(patch)
         
-        # Get volume dimensions
-        _, h, w, d = volume.shape
+        # Filter out background patches
+        if mean_intensity < 0.1:
+            return False
         
-        # Find tumor locations
-        tumor_coords = np.where(segmentation > 0)
-        if len(tumor_coords[0]) == 0:
-            return patches
-        
-        # Extract patches around tumor locations
-        max_attempts = self.config.patches_per_volume * 5
-        attempts = 0
-        
-        while len(patches) < self.config.patches_per_volume and attempts < max_attempts:
-            # Random tumor voxel
-            idx = random.randint(0, len(tumor_coords[0]) - 1)
-            center_x, center_y, center_z = (tumor_coords[0][idx], 
-                                          tumor_coords[1][idx], 
-                                          tumor_coords[2][idx])
+        # Filter out high-variance patches (likely containing lesions)
+        if std_intensity > threshold:
+            return False
             
-            # Calculate patch boundaries
-            x = max(0, min(center_x - patch_size//2, h - patch_size))
-            y = max(0, min(center_y - patch_size//2, w - patch_size))
-            z = max(0, min(center_z - patch_size//2, d - patch_size))
+        # Filter out very bright patches (likely lesions)
+        if mean_intensity > 0.8:
+            return False
             
-            # Extract patch
-            seg_patch = segmentation[x:x+patch_size, y:y+patch_size, z:z+patch_size]
-            
-            # Check if patch contains tumor
-            if seg_patch.sum() > 0:
-                volume_patch = volume[:, x:x+patch_size, y:y+patch_size, z:z+patch_size]
-                patches.append(volume_patch)
-            
-            attempts += 1
-        
-        return patches
+        return True
     
-    def process_dataset(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Process entire dataset and extract patches"""
-        subjects = self.load_subjects()
+    def process_subject(self, filepath):
+        """Process a single subject file"""
+        print(f"Processing: {filepath}")
         
-        normal_patches = []
-        anomaly_patches = []
-        
-        logger.info("Extracting patches from volumes...")
-        
-        for subject_id in tqdm(subjects, desc="Processing subjects"):
-            try:
-                volume, segmentation = self.load_volume(subject_id)
-                
-                # Extract normal patches (for training)
-                normal_patches_subject = self.extract_normal_patches(volume, segmentation)
-                normal_patches.extend(normal_patches_subject)
-                
-                # Extract anomaly patches (for testing)
-                anomaly_patches_subject = self.extract_anomaly_patches(volume, segmentation)
-                anomaly_patches.extend(anomaly_patches_subject)
-                
-            except Exception as e:
-                logger.error(f"Error processing subject {subject_id}: {e}")
-                continue
-        
-        logger.info(f"Extracted {len(normal_patches)} normal patches")
-        logger.info(f"Extracted {len(anomaly_patches)} anomaly patches")
-        
-        # Convert to numpy arrays
-        if normal_patches:
-            normal_patches = np.array(normal_patches)
-        else:
-            normal_patches = np.empty((0, 4, self.config.patch_size, 
-                                     self.config.patch_size, self.config.patch_size))
-            
-        if anomaly_patches:
-            anomaly_patches = np.array(anomaly_patches)
-        else:
-            anomaly_patches = np.empty((0, 4, self.config.patch_size, 
-                                      self.config.patch_size, self.config.patch_size))
-        
-        # Combine patches and create labels
-        all_patches = np.concatenate([normal_patches, anomaly_patches], axis=0)
-        labels = np.concatenate([
-            np.zeros(len(normal_patches)),  # Normal = 0
-            np.ones(len(anomaly_patches))   # Anomaly = 1
-        ])
-        
-        return all_patches, labels
-
-
-class Trainer:
-    """Training class for the autoencoder"""
-    
-    def __init__(self, model: nn.Module, config: Config):
-        self.model = model
-        self.config = config
-        self.device = config.device
-        
-        # Move model to device
-        self.model.to(self.device)
-        
-        # Setup optimizer and loss
-        self.optimizer = optim.Adam(
-            self.model.parameters(), 
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay
-        )
-        self.criterion = nn.MSELoss()
-        
-        # Training history
-        self.train_losses = []
-        self.val_losses = []
-        
-    def train_epoch(self, train_loader: DataLoader) -> float:
-        """Train for one epoch"""
-        self.model.train()
-        total_loss = 0.0
-        num_batches = len(train_loader)
-        
-        progress_bar = tqdm(train_loader, desc="Training", leave=False)
-        
-        for batch_idx, batch in enumerate(progress_bar):
-            if isinstance(batch, tuple):
-                data, _ = batch
-            else:
-                data = batch
-                
-            data = data.to(self.device)
-            
-            # Forward pass
-            self.optimizer.zero_grad()
-            reconstructed, _ = self.model(data)
-            loss = self.criterion(reconstructed, data)
-            
-            # Backward pass
-            loss.backward()
-            self.optimizer.step()
-            
-            total_loss += loss.item()
-            
-            # Update progress bar
-            progress_bar.set_postfix({
-                'Loss': f'{loss.item():.6f}',
-                'Avg Loss': f'{total_loss/(batch_idx+1):.6f}'
-            })
-        
-        return total_loss / num_batches
-    
-    def validate_epoch(self, val_loader: DataLoader) -> float:
-        """Validate for one epoch"""
-        self.model.eval()
-        total_loss = 0.0
-        num_batches = len(val_loader)
-        
-        with torch.no_grad():
-            progress_bar = tqdm(val_loader, desc="Validation", leave=False)
-            
-            for batch in progress_bar:
-                if isinstance(batch, tuple):
-                    data, _ = batch
-                else:
-                    data = batch
-                    
-                data = data.to(self.device)
-                
-                # Forward pass
-                reconstructed, _ = self.model(data)
-                loss = self.criterion(reconstructed, data)
-                
-                total_loss += loss.item()
-                
-                # Update progress bar
-                progress_bar.set_postfix({'Val Loss': f'{loss.item():.6f}'})
-        
-        return total_loss / num_batches
-    
-    def train(self, train_loader: DataLoader, val_loader: DataLoader = None):
-        """Full training loop"""
-        logger.info(f"Starting training on {self.device}")
-        logger.info(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        
-        best_val_loss = float('inf')
-        patience_counter = 0
-        patience = 10
-        
-        for epoch in range(self.config.epochs):
-            start_time = time.time()
-            
-            # Train
-            train_loss = self.train_epoch(train_loader)
-            self.train_losses.append(train_loss)
-            
-            # Validate
-            if val_loader is not None:
-                val_loss = self.validate_epoch(val_loader)
-                self.val_losses.append(val_loss)
-                
-                # Early stopping
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
-                    patience_counter = 0
-                    if self.config.save_model:
-                        self.save_model('best_autoencoder_brats.pth')
-                else:
-                    patience_counter += 1
-                
-                epoch_time = time.time() - start_time
-                logger.info(f"Epoch {epoch+1}/{self.config.epochs} - "
-                          f"Train Loss: {train_loss:.6f} - "
-                          f"Val Loss: {val_loss:.6f} - "
-                          f"Time: {epoch_time:.2f}s")
-                
-                if patience_counter >= patience:
-                    logger.info(f"Early stopping at epoch {epoch+1}")
-                    break
-            else:
-                epoch_time = time.time() - start_time
-                logger.info(f"Epoch {epoch+1}/{self.config.epochs} - "
-                          f"Train Loss: {train_loss:.6f} - "
-                          f"Time: {epoch_time:.2f}s")
-        
-        logger.info("Training completed!")
-    
-    def save_model(self, filename: str):
-        """Save model checkpoint"""
-        filepath = Path(self.config.output_dir) / filename
-        torch.save({
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'config': self.config,
-            'train_losses': self.train_losses,
-            'val_losses': self.val_losses
-        }, filepath)
-        logger.info(f"Model saved to {filepath}")
-    
-    def load_model(self, filename: str):
-        """Load model checkpoint"""
-        filepath = Path(self.config.output_dir) / filename
-        checkpoint = torch.load(filepath, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.train_losses = checkpoint.get('train_losses', [])
-        self.val_losses = checkpoint.get('val_losses', [])
-        logger.info(f"Model loaded from {filepath}")
-
-
-class AnomalyDetector:
-    """Anomaly detection using reconstruction error"""
-    
-    def __init__(self, model: nn.Module, config: Config):
-        self.model = model
-        self.config = config
-        self.device = config.device
-        self.model.eval()
-        
-    def compute_reconstruction_errors(self, data_loader: DataLoader) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Compute reconstruction errors for all samples"""
-        reconstruction_errors = []
-        latent_features = []
-        true_labels = []
-        
-        self.model.eval()
-        with torch.no_grad():
-            progress_bar = tqdm(data_loader, desc="Computing reconstruction errors")
-            
-            for batch in progress_bar:
-                if isinstance(batch, tuple):
-                    data, labels = batch
-                    true_labels.extend(labels.cpu().numpy())
-                else:
-                    data = batch
-                    
-                data = data.to(self.device)
-                
-                # Forward pass
-                reconstructed, latent = self.model(data)
-                
-                # Compute reconstruction error (MSE per sample)
-                mse = F.mse_loss(reconstructed, data, reduction='none')
-                mse = mse.view(mse.size(0), -1).mean(dim=1)
-                
-                reconstruction_errors.extend(mse.cpu().numpy())
-                latent_features.extend(latent.cpu().numpy())
-        
-        return (np.array(reconstruction_errors), 
-                np.array(latent_features), 
-                np.array(true_labels) if true_labels else None)
-    
-    def find_optimal_threshold(self, reconstruction_errors: np.ndarray, 
-                             true_labels: np.ndarray) -> Tuple[float, Dict]:
-        """Find optimal threshold for anomaly detection"""
-        if true_labels is None:
-            # Use percentile-based threshold
-            threshold = np.percentile(reconstruction_errors, 
-                                    self.config.anomaly_threshold_percentile)
-            return threshold, {}
-        
-        # Find threshold that maximizes F1 score
-        thresholds = np.linspace(reconstruction_errors.min(), 
-                               reconstruction_errors.max(), 100)
-        
-        best_threshold = thresholds[0]
-        best_f1 = 0
-        best_metrics = {}
-        
-        for threshold in thresholds:
-            predictions = (reconstruction_errors > threshold).astype(int)
-            
-            if len(np.unique(predictions)) > 1:  # Avoid division by zero
-                f1 = f1_score(true_labels, predictions)
-                if f1 > best_f1:
-                    best_f1 = f1
-                    best_threshold = threshold
-                    best_metrics = {
-                        'accuracy': accuracy_score(true_labels, predictions),
-                        'precision': precision_score(true_labels, predictions),
-                        'recall': recall_score(true_labels, predictions),
-                        'f1': f1
-                    }
-        
-        return best_threshold, best_metrics
-    
-    def evaluate(self, data_loader: DataLoader) -> Dict:
-        """Comprehensive evaluation of anomaly detection"""
-        logger.info("Starting anomaly detection evaluation...")
-        
-        # Compute reconstruction errors
-        reconstruction_errors, latent_features, true_labels = \
-            self.compute_reconstruction_errors(data_loader)
-        
-        results = {
-            'reconstruction_errors': reconstruction_errors,
-            'latent_features': latent_features,
-            'true_labels': true_labels
-        }
-        
-        if true_labels is not None:
-            # Find optimal threshold
-            optimal_threshold, threshold_metrics = \
-                self.find_optimal_threshold(reconstruction_errors, true_labels)
-            
-            # Make predictions with optimal threshold
-            predictions = (reconstruction_errors > optimal_threshold).astype(int)
-            
-            # Compute metrics
-            metrics = {
-                'roc_auc': roc_auc_score(true_labels, reconstruction_errors),
-                'average_precision': average_precision_score(true_labels, reconstruction_errors),
-                'optimal_threshold': optimal_threshold,
-                'accuracy': accuracy_score(true_labels, predictions),
-                'precision': precision_score(true_labels, predictions),
-                'recall': recall_score(true_labels, predictions),
-                'f1_score': f1_score(true_labels, predictions),
-                'confusion_matrix': confusion_matrix(true_labels, predictions)
-            }
-            
-            results.update(metrics)
-            
-            # Log results
-            logger.info("Anomaly Detection Results:")
-            logger.info(f"ROC AUC: {metrics['roc_auc']:.4f}")
-            logger.info(f"Average Precision: {metrics['average_precision']:.4f}")
-            logger.info(f"Optimal Threshold: {metrics['optimal_threshold']:.6f}")
-            logger.info(f"Accuracy: {metrics['accuracy']:.4f}")
-            logger.info(f"Precision: {metrics['precision']:.4f}")
-            logger.info(f"Recall: {metrics['recall']:.4f}")
-            logger.info(f"F1 Score: {metrics['f1_score']:.4f}")
-        
-        return results
-
-
-class Visualizer:
-    """Visualization utilities"""
-    
-    def __init__(self, config: Config):
-        self.config = config
-        self.output_dir = Path(config.output_dir)
-        self.output_dir.mkdir(exist_ok=True)
-        
-        # Set style
-        plt.style.use('seaborn-v0_8')
-        sns.set_palette("husl")
-    
-    def plot_training_curves(self, train_losses: List[float], 
-                           val_losses: List[float] = None):
-        """Plot training and validation loss curves"""
-        plt.figure(figsize=(10, 6))
-        
-        epochs = range(1, len(train_losses) + 1)
-        plt.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
-        
-        if val_losses:
-            plt.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2)
-        
-        plt.title('Training Progress', fontsize=16, fontweight='bold')
-        plt.xlabel('Epoch', fontsize=12)
-        plt.ylabel('Loss', fontsize=12)
-        plt.legend(fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        plt.savefig(self.output_dir / 'training_curves.png', dpi=300, bbox_inches='tight')
-        plt.close()
-        
-    def plot_confusion_matrix(self, cm: np.ndarray):
-        """Plot confusion matrix"""
-        plt.figure(figsize=(8, 6))
-        
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
-                   xticklabels=['Normal', 'Anomaly'],
-                   yticklabels=['Normal', 'Anomaly'])
-        
-        plt.title('Confusion Matrix', fontsize=16, fontweight='bold')
-        plt.xlabel('Predicted', fontsize=12)
-        plt.ylabel('Actual', fontsize=12)
-        plt.tight_layout()
-        
-        plt.savefig(self.output_dir / 'confusion_matrix.png', dpi=300, bbox_inches='tight')
-        plt.close()
-    
-    def plot_roc_curve(self, true_labels: np.ndarray, scores: np.ndarray, auc_score: float):
-        """Plot ROC curve"""
-        fpr, tpr, _ = roc_curve(true_labels, scores)
-        
-        plt.figure(figsize=(8, 6))
-        plt.plot(fpr, tpr, 'b-', linewidth=2, label=f'ROC Curve (AUC = {auc_score:.3f})')
-        plt.plot([0, 1], [0, 1], 'r--', linewidth=2, label='Random Classifier')
-        
-        plt.title('ROC Curve', fontsize=16, fontweight='bold')
-        plt.xlabel('False Positive Rate', fontsize=12)
-        plt.ylabel('True Positive Rate', fontsize=12)
-        plt.legend(fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        plt.savefig(self.output_dir / 'roc_curve.png', dpi=300, bbox_inches='tight')
-        plt.close()
-    
-    def plot_precision_recall_curve(self, true_labels: np.ndarray, scores: np.ndarray, ap_score: float):
-        """Plot Precision-Recall curve"""
-        precision, recall, _ = precision_recall_curve(true_labels, scores)
-        
-        plt.figure(figsize=(8, 6))
-        plt.plot(recall, precision, 'b-', linewidth=2, 
-                label=f'PR Curve (AP = {ap_score:.3f})')
-        
-        plt.title('Precision-Recall Curve', fontsize=16, fontweight='bold')
-        plt.xlabel('Recall', fontsize=12)
-        plt.ylabel('Precision', fontsize=12)
-        plt.legend(fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        plt.savefig(self.output_dir / 'precision_recall_curve.png', dpi=300, bbox_inches='tight')
-        plt.close()
-    
-    def plot_reconstruction_error_histogram(self, reconstruction_errors: np.ndarray, 
-                                          true_labels: np.ndarray = None, 
-                                          threshold: float = None):
-        """Plot histogram of reconstruction errors"""
-        plt.figure(figsize=(10, 6))
-        
-        if true_labels is not None:
-            normal_errors = reconstruction_errors[true_labels == 0]
-            anomaly_errors = reconstruction_errors[true_labels == 1]
-            
-            plt.hist(normal_errors, bins=50, alpha=0.7, label='Normal', 
-                    color='blue', density=True)
-            plt.hist(anomaly_errors, bins=50, alpha=0.7, label='Anomaly', 
-                    color='red', density=True)
-        else:
-            plt.hist(reconstruction_errors, bins=50, alpha=0.7, 
-                    color='blue', density=True)
-        
-        if threshold is not None:
-            plt.axvline(threshold, color='black', linestyle='--', linewidth=2,
-                       label=f'Threshold = {threshold:.4f}')
-        
-        plt.title('Reconstruction Error Distribution', fontsize=16, fontweight='bold')
-        plt.xlabel('Reconstruction Error', fontsize=12)
-        plt.ylabel('Density', fontsize=12)
-        plt.legend(fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        
-        plt.savefig(self.output_dir / 'reconstruction_error_histogram.png', 
-                   dpi=300, bbox_inches='tight')
-        plt.close()
-    
-    def plot_latent_space_projection(self, latent_features: np.ndarray, 
-                                   true_labels: np.ndarray = None, 
-                                   method: str = 'tsne'):
-        """Plot 2D projection of latent space"""
-        if latent_features.shape[0] < 50:
-            logger.warning("Too few samples for meaningful latent space visualization")
+        volume = self.load_nifti(filepath)
+        if volume is None:
             return
         
-        # Reduce dimensionality
-        if method.lower() == 'tsne':
-            reducer = TSNE(n_components=2, random_state=42, perplexity=min(30, len(latent_features)//4))
-            projection = reducer.fit_transform(latent_features)
-            title = 't-SNE Projection of Latent Space'
-        else:  # PCA
-            reducer = PCA(n_components=2, random_state=42)
-            projection = reducer.fit_transform(latent_features)
-            title = 'PCA Projection of Latent Space'
+        # Normalize volume
+        volume = self.normalize_volume(volume)
         
-        plt.figure(figsize=(10, 8))
+        # Extract patches
+        patches = self.extract_patches_3d(volume, self.patch_size, self.stride)
         
-        if true_labels is not None:
-            scatter = plt.scatter(projection[true_labels == 0, 0], 
-                                projection[true_labels == 0, 1],
-                                c='blue', alpha=0.6, label='Normal', s=50)
-            scatter = plt.scatter(projection[true_labels == 1, 0], 
-                                projection[true_labels == 1, 1],
-                                c='red', alpha=0.6, label='Anomaly', s=50)
-            plt.legend(fontsize=12)
-        else:
-            plt.scatter(projection[:, 0], projection[:, 1], 
-                       c='blue', alpha=0.6, s=50)
+        # Classify patches as healthy or abnormal
+        healthy_count = 0
+        abnormal_count = 0
         
-        plt.title(title, fontsize=16, fontweight='bold')
-        plt.xlabel('Component 1', fontsize=12)
-        plt.ylabel('Component 2', fontsize=12)
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
+        for patch in patches:
+            if self.is_healthy_patch(patch):
+                self.healthy_patches.append(patch)
+                healthy_count += 1
+            else:
+                self.abnormal_patches.append(patch)
+                abnormal_count += 1
         
-        filename = f'latent_space_{method.lower()}.png'
-        plt.savefig(self.output_dir / filename, dpi=300, bbox_inches='tight')
-        plt.close()
+        print(f"  Extracted {healthy_count} healthy and {abnormal_count} abnormal patches")
     
-    def visualize_3d_patches(self, patches: np.ndarray, labels: np.ndarray = None, 
-                           num_samples: int = 5):
-        """Visualize 3D patches by showing middle slices"""
+    def visualize_patches(self, patches, title="Patches", max_display=5):
+        """Visualize 3D patches as slices"""
         if len(patches) == 0:
+            print(f"No {title.lower()} to visualize")
             return
             
-        num_samples = min(num_samples, len(patches))
-        indices = np.random.choice(len(patches), num_samples, replace=False)
+        fig, axes = plt.subplots(max_display, self.patch_size[0], 
+                                figsize=(15, max_display * 2))
+        fig.suptitle(f"{title} - All Slices", fontsize=16)
         
-        fig, axes = plt.subplots(num_samples, 4, figsize=(16, 4*num_samples))
-        if num_samples == 1:
-            axes = axes.reshape(1, -1)
-        
-        modality_names = ['T1n', 'T1c', 'T2w', 'T2-FLAIR']
-        
-        for i, idx in enumerate(indices):
-            patch = patches[idx]  # Shape: [4, D, H, W]
-            label_text = f"Label: {'Anomaly' if labels is not None and labels[idx] == 1 else 'Normal'}"
-            
-            for j, modality in enumerate(modality_names):
-                # Show middle slice
-                middle_slice = patch[j, :, :, patch.shape[3]//2]
+        for i in range(min(max_display, len(patches))):
+            patch = patches[i]
+            for slice_idx in range(self.patch_size[0]):
+                if max_display == 1:
+                    ax = axes[slice_idx]
+                else:
+                    ax = axes[i, slice_idx]
                 
-                axes[i, j].imshow(middle_slice, cmap='gray')
-                axes[i, j].set_title(f'{modality}\n{label_text if j == 0 else ""}')
-                axes[i, j].axis('off')
+                ax.imshow(patch[slice_idx], cmap='gray')
+                ax.set_title(f"Patch {i+1}, Slice {slice_idx+1}")
+                ax.axis('off')
         
         plt.tight_layout()
-        plt.savefig(self.output_dir / 'sample_patches.png', dpi=300, bbox_inches='tight')
-        plt.close()
+        plt.show()
     
-    def create_summary_plot(self, results: Dict):
-        """Create a comprehensive summary plot"""
-        if 'true_labels' not in results or results['true_labels'] is None:
-            return
+    def prepare_data(self, max_subjects=None):
+        """Prepare training and test data"""
+        files = self.find_brats_files(max_subjects)
+        
+        if not files:
+            raise ValueError("No BRATS files found!")
+        
+        # Process all subjects
+        for filepath in files:
+            self.process_subject(filepath)
+        
+        print(f"\nTotal extracted patches:")
+        print(f"  Healthy: {len(self.healthy_patches)}")
+        print(f"  Abnormal: {len(self.abnormal_patches)}")
+        
+        if len(self.healthy_patches) == 0:
+            raise ValueError("No healthy patches found! Try adjusting threshold parameters.")
+        
+        # Visualize sample patches
+        print("\nVisualizing sample healthy patches...")
+        self.visualize_patches(self.healthy_patches[:3], "Healthy Patches", 3)
+        
+        print("Visualizing sample abnormal patches...")
+        self.visualize_patches(self.abnormal_patches[:3], "Abnormal Patches", 3)
+        
+        # Prepare training data (only healthy patches)
+        healthy_patches = np.array(self.healthy_patches)
+        
+        # Split healthy patches for training (80%) and testing (20%)
+        train_healthy, test_healthy = train_test_split(
+            healthy_patches, test_size=0.2, random_state=42
+        )
+        
+        # For testing, use some healthy and some abnormal patches
+        max_test_abnormal = min(len(test_healthy), len(self.abnormal_patches))
+        test_abnormal = np.array(self.abnormal_patches[:max_test_abnormal])
+        
+        return train_healthy, test_healthy, test_abnormal
+
+
+# PyTorch Implementation
+if FRAMEWORK == 'pytorch':
+    class BratsDataset(Dataset):
+        def __init__(self, patches):
+            self.patches = torch.FloatTensor(patches)
+            if len(self.patches.shape) == 4:  # Add channel dimension
+                self.patches = self.patches.unsqueeze(1)
+        
+        def __len__(self):
+            return len(self.patches)
+        
+        def __getitem__(self, idx):
+            return self.patches[idx], self.patches[idx]  # Input = Target for autoencoder
+
+    class Autoencoder3D(nn.Module):
+        def __init__(self, input_shape=(1, 32, 32, 32)):
+            super(Autoencoder3D, self).__init__()
             
-        fig = plt.figure(figsize=(20, 12))
+            # Encoder
+            self.encoder = nn.Sequential(
+                nn.Conv3d(1, 16, 3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool3d(2),
+                
+                nn.Conv3d(16, 32, 3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool3d(2),
+                
+                nn.Conv3d(32, 64, 3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool3d(2),
+                
+                nn.Conv3d(64, 128, 3, padding=1),
+                nn.ReLU(),
+                nn.AdaptiveAvgPool3d((2, 2, 2))
+            )
+            
+            # Decoder
+            self.decoder = nn.Sequential(
+                nn.ConvTranspose3d(128, 64, 3, stride=2, padding=1, output_padding=1),
+                nn.ReLU(),
+                
+                nn.ConvTranspose3d(64, 32, 3, stride=2, padding=1, output_padding=1),
+                nn.ReLU(),
+                
+                nn.ConvTranspose3d(32, 16, 3, stride=2, padding=1, output_padding=1),
+                nn.ReLU(),
+                
+                nn.ConvTranspose3d(16, 1, 3, padding=1),
+                nn.Sigmoid()
+            )
         
-        # 1. Confusion Matrix
-        plt.subplot(2, 4, 1)
-        cm = results['confusion_matrix']
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                   xticklabels=['Normal', 'Anomaly'],
-                   yticklabels=['Normal', 'Anomaly'])
-        plt.title('Confusion Matrix')
+        def forward(self, x):
+            encoded = self.encoder(x)
+            decoded = self.decoder(encoded)
+            return decoded
+
+    def train_pytorch_model(train_data, epochs=50, batch_size=8, lr=0.001):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {device}")
         
-        # 2. ROC Curve
-        plt.subplot(2, 4, 2)
-        fpr, tpr, _ = roc_curve(results['true_labels'], results['reconstruction_errors'])
-        plt.plot(fpr, tpr, 'b-', linewidth=2, label=f'AUC = {results["roc_auc"]:.3f}')
-        plt.plot([0, 1], [0, 1], 'r--', linewidth=2, label='Random Classifier')
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('ROC Curve')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+        dataset = BratsDataset(train_data)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
         
-        # 3. Precision-Recall Curve
-        plt.subplot(2, 4, 3)
-        precision, recall, _ = precision_recall_curve(results['true_labels'], 
-                                                    results['reconstruction_errors'])
-        plt.plot(recall, precision, 'b-', linewidth=2, 
-                label=f'AP = {results["average_precision"]:.3f}')
-        plt.xlabel('Recall')
-        plt.ylabel('Precision')
-        plt.title('Precision-Recall Curve')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
+        model = Autoencoder3D().to(device)
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=lr)
         
-        # 4. Reconstruction Error Histogram
-        plt.subplot(2, 4, 4)
-        normal_errors = results['reconstruction_errors'][results['true_labels'] == 0]
-        anomaly_errors = results['reconstruction_errors'][results['true_labels'] == 1]
-        plt.hist(normal_errors, bins=30, alpha=0.7, label='Normal', density=True)
-        plt.hist(anomaly_errors, bins=30, alpha=0.7, label='Anomaly', density=True)
-        plt.axvline(results['optimal_threshold'], color='black', linestyle='--',
-                   label=f'Threshold = {results["optimal_threshold"]:.4f}')
-        plt.xlabel('Reconstruction Error')
-        plt.ylabel('Density')
-        plt.title('Error Distribution')
-        plt.legend()
+        model.train()
+        losses = []
         
-        # 5-8. Metrics Summary
-        plt.subplot(2, 4, (5, 8))
-        metrics_text = f"""
-        ANOMALY DETECTION RESULTS
+        print(f"\nTraining autoencoder for {epochs} epochs...")
         
-        ROC AUC: {results['roc_auc']:.4f}
-        Average Precision: {results['average_precision']:.4f}
+        for epoch in tqdm(range(epochs), desc="Training Progress"):
+            epoch_loss = 0
+            batch_count = 0
+            
+            for batch_idx, (data, target) in enumerate(dataloader):
+                data, target = data.to(device), target.to(device)
+                
+                optimizer.zero_grad()
+                output = model(data)
+                loss = criterion(output, target)
+                loss.backward()
+                optimizer.step()
+                
+                epoch_loss += loss.item()
+                batch_count += 1
+            
+            avg_loss = epoch_loss / batch_count
+            losses.append(avg_loss)
+            
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
         
-        Optimal Threshold: {results['optimal_threshold']:.6f}
+        return model, losses
+
+    def evaluate_pytorch_model(model, test_healthy, test_abnormal):
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        model.eval()
         
-        Accuracy: {results['accuracy']:.4f}
-        Precision: {results['precision']:.4f}
-        Recall: {results['recall']:.4f}
-        F1 Score: {results['f1_score']:.4f}
+        def get_reconstruction_errors(patches):
+            errors = []
+            dataset = BratsDataset(patches)
+            dataloader = DataLoader(dataset, batch_size=8, shuffle=False)
+            
+            with torch.no_grad():
+                for data, _ in dataloader:
+                    data = data.to(device)
+                    reconstructed = model(data)
+                    
+                    # Calculate MSE for each sample
+                    mse = torch.mean((data - reconstructed) ** 2, dim=(1, 2, 3, 4))
+                    errors.extend(mse.cpu().numpy())
+            
+            return np.array(errors)
         
-        Normal Samples: {np.sum(results['true_labels'] == 0)}
-        Anomaly Samples: {np.sum(results['true_labels'] == 1)}
-        """
+        print("\nEvaluating model...")
         
-        plt.text(0.1, 0.5, metrics_text, fontsize=14, verticalalignment='center',
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="lightblue", alpha=0.8))
-        plt.axis('off')
+        healthy_errors = get_reconstruction_errors(test_healthy)
+        abnormal_errors = get_reconstruction_errors(test_abnormal)
         
-        plt.tight_layout()
-        plt.savefig(self.output_dir / 'anomaly_detection_summary.png', 
-                   dpi=300, bbox_inches='tight')
-        plt.close()
+        return healthy_errors, abnormal_errors
+
+# TensorFlow Implementation
+else:
+    def create_tensorflow_autoencoder(input_shape=(32, 32, 32, 1)):
+        # Encoder
+        inputs = keras.Input(shape=input_shape)
+        
+        x = layers.Conv3D(16, 3, activation='relu', padding='same')(inputs)
+        x = layers.MaxPooling3D(2, padding='same')(x)
+        
+        x = layers.Conv3D(32, 3, activation='relu', padding='same')(x)
+        x = layers.MaxPooling3D(2, padding='same')(x)
+        
+        x = layers.Conv3D(64, 3, activation='relu', padding='same')(x)
+        x = layers.MaxPooling3D(2, padding='same')(x)
+        
+        x = layers.Conv3D(128, 3, activation='relu', padding='same')(x)
+        encoded = layers.GlobalAveragePooling3D()(x)
+        
+        # Decoder
+        x = layers.Reshape((2, 2, 2, 128))(encoded)
+        
+        x = layers.Conv3DTranspose(64, 3, strides=2, activation='relu', padding='same')(x)
+        x = layers.Conv3DTranspose(32, 3, strides=2, activation='relu', padding='same')(x)
+        x = layers.Conv3DTranspose(16, 3, strides=2, activation='relu', padding='same')(x)
+        
+        outputs = layers.Conv3D(1, 3, activation='sigmoid', padding='same')(x)
+        
+        autoencoder = keras.Model(inputs, outputs)
+        return autoencoder
+
+    def train_tensorflow_model(train_data, epochs=50, batch_size=8, lr=0.001):
+        print(f"Using TensorFlow with GPU: {tf.config.list_physical_devices('GPU')}")
+        
+        # Prepare data
+        train_data = train_data[..., np.newaxis]  # Add channel dimension
+        
+        model = create_tensorflow_autoencoder(train_data.shape[1:])
+        model.compile(optimizer=keras.optimizers.Adam(lr), loss='mse')
+        
+        print(f"\nTraining autoencoder for {epochs} epochs...")
+        
+        # Custom callback for smooth progress bar
+        class SmoothProgressCallback(keras.callbacks.Callback):
+            def __init__(self, epochs):
+                self.epochs = epochs
+                self.pbar = None
+                
+            def on_train_begin(self, logs=None):
+                self.pbar = tqdm(total=self.epochs, desc="Training Progress")
+                
+            def on_epoch_end(self, epoch, logs=None):
+                self.pbar.set_postfix({'loss': f"{logs.get('loss', 0):.6f}"})
+                self.pbar.update(1)
+                
+            def on_train_end(self, logs=None):
+                self.pbar.close()
+        
+        history = model.fit(
+            train_data, train_data,
+            epochs=epochs,
+            batch_size=batch_size,
+            verbose=0,
+            callbacks=[SmoothProgressCallback(epochs)]
+        )
+        
+        return model, history.history['loss']
+
+    def evaluate_tensorflow_model(model, test_healthy, test_abnormal):
+        print("\nEvaluating model...")
+        
+        def get_reconstruction_errors(patches):
+            patches = patches[..., np.newaxis]  # Add channel dimension
+            reconstructed = model.predict(patches, verbose=0)
+            errors = np.mean((patches - reconstructed) ** 2, axis=(1, 2, 3, 4))
+            return errors
+        
+        healthy_errors = get_reconstruction_errors(test_healthy)
+        abnormal_errors = get_reconstruction_errors(test_abnormal)
+        
+        return healthy_errors, abnormal_errors
 
 
-def set_seed(seed: int):
-    """Set random seeds for reproducibility"""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+def calculate_metrics_and_visualize(healthy_errors, abnormal_errors):
+    """Calculate metrics and create visualizations"""
+    
+    # Prepare labels and scores
+    y_true = np.concatenate([
+        np.zeros(len(healthy_errors)),  # Healthy = 0 (normal)
+        np.ones(len(abnormal_errors))   # Abnormal = 1 (anomaly)
+    ])
+    
+    y_scores = np.concatenate([healthy_errors, abnormal_errors])
+    
+    # Find optimal threshold using ROC curve
+    fpr, tpr, thresholds = roc_curve(y_true, y_scores)
+    optimal_idx = np.argmax(tpr - fpr)
+    optimal_threshold = thresholds[optimal_idx]
+    
+    y_pred = (y_scores > optimal_threshold).astype(int)
+    
+    # Calculate metrics
+    roc_auc = roc_auc_score(y_true, y_scores)
+    avg_precision = average_precision_score(y_true, y_scores)
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred)
+    recall = recall_score(y_true, y_pred)
+    f1 = f1_score(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)
+    
+    # Print metrics
+    print(f"\n{'='*50}")
+    print("ANOMALY DETECTION RESULTS")
+    print(f"{'='*50}")
+    print(f"ROC AUC:           {roc_auc:.4f}")
+    print(f"Average Precision: {avg_precision:.4f}")
+    print(f"Accuracy:          {accuracy:.4f}")
+    print(f"Precision:         {precision:.4f}")
+    print(f"Recall:            {recall:.4f}")
+    print(f"F1 Score:          {f1:.4f}")
+    print(f"Optimal Threshold: {optimal_threshold:.6f}")
+    print(f"{'='*50}")
+    
+    # Create visualizations
+    plt.style.use('default')
+    fig = plt.figure(figsize=(20, 15))
+    
+    # 1. Training Loss (if available from global scope)
+    plt.subplot(3, 4, 1)
+    if 'training_losses' in globals():
+        plt.plot(training_losses)
+        plt.title('Training Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.grid(True)
+    else:
+        plt.text(0.5, 0.5, 'Training Loss\nNot Available', 
+                ha='center', va='center', transform=plt.gca().transAxes)
+    
+    # 2. Reconstruction Error Histogram
+    plt.subplot(3, 4, 2)
+    plt.hist(healthy_errors, bins=50, alpha=0.7, label='Healthy', density=True)
+    plt.hist(abnormal_errors, bins=50, alpha=0.7, label='Abnormal', density=True)
+    plt.axvline(optimal_threshold, color='red', linestyle='--', label=f'Threshold: {optimal_threshold:.4f}')
+    plt.xlabel('Reconstruction Error')
+    plt.ylabel('Density')
+    plt.title('Reconstruction Error Distribution')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 3. ROC Curve
+    plt.subplot(3, 4, 3)
+    plt.plot(fpr, tpr, color='blue', lw=2, label=f'ROC (AUC = {roc_auc:.4f})')
+    plt.plot([0, 1], [0, 1], color='gray', lw=1, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve')
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
+    
+    # 4. Precision-Recall Curve
+    plt.subplot(3, 4, 4)
+    precision_curve, recall_curve, _ = precision_recall_curve(y_true, y_scores)
+    plt.plot(recall_curve, precision_curve, color='green', lw=2, 
+             label=f'PR (AP = {avg_precision:.4f})')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve')
+    plt.legend(loc="lower left")
+    plt.grid(True, alpha=0.3)
+    
+    # 5. Confusion Matrix
+    plt.subplot(3, 4, 5)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                xticklabels=['Normal', 'Anomaly'],
+                yticklabels=['Normal', 'Anomaly'])
+    plt.title('Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    
+    # 6. Metrics Bar Plot
+    plt.subplot(3, 4, 6)
+    metrics = ['ROC AUC', 'Avg Precision', 'Accuracy', 'Precision', 'Recall', 'F1']
+    values = [roc_auc, avg_precision, accuracy, precision, recall, f1]
+    bars = plt.bar(metrics, values, color=['skyblue', 'lightgreen', 'lightcoral', 
+                                          'gold', 'plum', 'lightsalmon'])
+    plt.title('Performance Metrics')
+    plt.ylabel('Score')
+    plt.xticks(rotation=45)
+    plt.ylim([0, 1])
+    
+    # Add value labels on bars
+    for bar, value in zip(bars, values):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f'{value:.3f}', ha='center', va='bottom')
+    
+    # 7. Error Scatter Plot
+    plt.subplot(3, 4, 7)
+    plt.scatter(range(len(healthy_errors)), healthy_errors, 
+               alpha=0.6, label='Healthy', s=20)
+    plt.scatter(range(len(healthy_errors), len(healthy_errors) + len(abnormal_errors)), 
+               abnormal_errors, alpha=0.6, label='Abnormal', s=20)
+    plt.axhline(optimal_threshold, color='red', linestyle='--', 
+                label=f'Threshold: {optimal_threshold:.4f}')
+    plt.xlabel('Sample Index')
+    plt.ylabel('Reconstruction Error')
+    plt.title('Reconstruction Errors by Sample')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 8. Box Plot of Errors
+    plt.subplot(3, 4, 8)
+    data_to_plot = [healthy_errors, abnormal_errors]
+    box_plot = plt.boxplot(data_to_plot, labels=['Healthy', 'Abnormal'], patch_artist=True)
+    box_plot['boxes'][0].set_facecolor('lightblue')
+    box_plot['boxes'][1].set_facecolor('lightcoral')
+    plt.ylabel('Reconstruction Error')
+    plt.title('Error Distribution Box Plot')
+    plt.grid(True, alpha=0.3)
+    
+    # 9. Threshold Analysis
+    plt.subplot(3, 4, 9)
+    thresholds_range = np.linspace(min(y_scores), max(y_scores), 100)
+    accuracies = []
+    f1_scores = []
+    
+    for thresh in thresholds_range:
+        y_pred_thresh = (y_scores > thresh).astype(int)
+        acc = accuracy_score(y_true, y_pred_thresh)
+        f1_thresh = f1_score(y_true, y_pred_thresh) if len(np.unique(y_pred_thresh)) > 1 else 0
+        accuracies.append(acc)
+        f1_scores.append(f1_thresh)
+    
+    plt.plot(thresholds_range, accuracies, label='Accuracy', color='blue')
+    plt.plot(thresholds_range, f1_scores, label='F1 Score', color='green')
+    plt.axvline(optimal_threshold, color='red', linestyle='--', 
+                label=f'Optimal: {optimal_threshold:.4f}')
+    plt.xlabel('Threshold')
+    plt.ylabel('Score')
+    plt.title('Threshold Analysis')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # 10. Error Statistics
+    plt.subplot(3, 4, 10)
+    stats_data = {
+        'Healthy Errors': {
+            'Mean': np.mean(healthy_errors),
+            'Std': np.std(healthy_errors),
+            'Min': np.min(healthy_errors),
+            'Max': np.max(healthy_errors)
+        },
+        'Abnormal Errors': {
+            'Mean': np.mean(abnormal_errors),
+            'Std': np.std(abnormal_errors),
+            'Min': np.min(abnormal_errors),
+            'Max': np.max(abnormal_errors)
+        }
+    }
+    
+    # Create text summary
+    text_summary = "Error Statistics:\n\n"
+    text_summary += "Healthy Patches:\n"
+    text_summary += f"  Mean: {stats_data['Healthy Errors']['Mean']:.6f}\n"
+    text_summary += f"  Std:  {stats_data['Healthy Errors']['Std']:.6f}\n"
+    text_summary += f"  Min:  {stats_data['Healthy Errors']['Min']:.6f}\n"
+    text_summary += f"  Max:  {stats_data['Healthy Errors']['Max']:.6f}\n\n"
+    text_summary += "Abnormal Patches:\n"
+    text_summary += f"  Mean: {stats_data['Abnormal Errors']['Mean']:.6f}\n"
+    text_summary += f"  Std:  {stats_data['Abnormal Errors']['Std']:.6f}\n"
+    text_summary += f"  Min:  {stats_data['Abnormal Errors']['Min']:.6f}\n"
+    text_summary += f"  Max:  {stats_data['Abnormal Errors']['Max']:.6f}\n"
+    
+    plt.text(0.05, 0.95, text_summary, transform=plt.gca().transAxes,
+             fontsize=10, verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+    plt.axis('off')
+    plt.title('Statistical Summary')
+    
+    # 11. Detection Performance by Error Range
+    plt.subplot(3, 4, 11)
+    error_ranges = np.percentile(y_scores, [0, 25, 50, 75, 100])
+    range_labels = ['0-25%', '25-50%', '50-75%', '75-100%']
+    
+    detection_rates = []
+    for i in range(len(error_ranges)-1):
+        mask = (y_scores >= error_ranges[i]) & (y_scores < error_ranges[i+1])
+        if i == len(error_ranges)-2:  # Last range includes maximum
+            mask = (y_scores >= error_ranges[i]) & (y_scores <= error_ranges[i+1])
+        
+        if np.sum(mask) > 0:
+            anomaly_rate = np.mean(y_true[mask])
+            detection_rates.append(anomaly_rate)
+        else:
+            detection_rates.append(0)
+    
+    bars = plt.bar(range_labels, detection_rates, color='lightsteelblue')
+    plt.title('Anomaly Rate by Error Percentile')
+    plt.ylabel('Anomaly Rate')
+    plt.xlabel('Error Percentile Range')
+    plt.ylim([0, 1])
+    
+    # Add value labels
+    for bar, rate in zip(bars, detection_rates):
+        plt.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.01,
+                f'{rate:.2f}', ha='center', va='bottom')
+    
+    # 12. Summary Information
+    plt.subplot(3, 4, 12)
+    summary_text = f"""
+ANOMALY DETECTION SUMMARY
 
+Dataset Information:
+• Healthy patches: {len(healthy_errors)}
+• Abnormal patches: {len(abnormal_errors)}
+• Total test samples: {len(y_true)}
 
-def parse_arguments():
-    """Parse command line arguments"""
-    parser = argparse.ArgumentParser(
-        description='3D Autoencoder for Anomaly Detection on BraTS Dataset'
-    )
+Model Performance:
+• ROC AUC: {roc_auc:.4f}
+• Average Precision: {avg_precision:.4f}
+• Accuracy: {accuracy:.4f}
+• F1 Score: {f1:.4f}
+
+Threshold: {optimal_threshold:.6f}
+
+Classification Results:
+• True Positives: {cm[1,1]}
+• False Positives: {cm[0,1]}
+• True Negatives: {cm[0,0]}
+• False Negatives: {cm[1,0]}
+"""
     
-    # Dataset parameters
-    parser.add_argument('--dataset_path', type=str, 
-                       default='datasets/BraTS2025-GLI-PRE-Challenge-TrainingData',
-                       help='Path to BraTS dataset')
-    parser.add_argument('--num_subjects', type=int, default=0,
-                       help='Number of subjects to use (0 = all)')
-    parser.add_argument('--patch_size', type=int, default=32,
-                       help='Size of 3D patches')
-    parser.add_argument('--patches_per_volume', type=int, default=20,
-                       help='Number of patches to extract per volume')
-    parser.add_argument('--train_ratio', type=float, default=0.8,
-                       help='Ratio of data for training')
+    plt.text(0.05, 0.95, summary_text, transform=plt.gca().transAxes,
+             fontsize=11, verticalalignment='top', fontfamily='monospace',
+             bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.8))
+    plt.axis('off')
+    plt.title('Summary')
     
-    # Model parameters
-    parser.add_argument('--latent_dim', type=int, default=128,
-                       help='Latent dimension of autoencoder')
-    parser.add_argument('--learning_rate', type=float, default=1e-3,
-                       help='Learning rate')
-    parser.add_argument('--batch_size', type=int, default=8,
-                       help='Batch size')
-    parser.add_argument('--epochs', type=int, default=50,
-                       help='Number of training epochs')
-    parser.add_argument('--weight_decay', type=float, default=1e-5,
-                       help='Weight decay for regularization')
+    plt.tight_layout()
+    plt.show()
     
-    # Training parameters
-    parser.add_argument('--num_workers', type=int, default=4,
-                       help='Number of data loader workers')
-    parser.add_argument('--seed', type=int, default=42,
-                       help='Random seed')
-    
-    # Output parameters
-    parser.add_argument('--output_dir', type=str, default='ae_brats2_results',
-                       help='Output directory')
-    parser.add_argument('--save_model', action='store_true',
-                       help='Save trained model')
-    parser.add_argument('--visualize', action='store_true', default=True,
-                       help='Create visualizations')
-    
-    # Anomaly detection parameters
-    parser.add_argument('--anomaly_threshold_percentile', type=float, default=95,
-                       help='Percentile for anomaly threshold when no labels available')
-    
-    return parser.parse_args()
+    return {
+        'roc_auc': roc_auc,
+        'average_precision': avg_precision,
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1,
+        'threshold': optimal_threshold,
+        'confusion_matrix': cm
+    }
 
 
 def main():
     """Main function"""
-    # Parse arguments
-    args = parse_arguments()
-    config = Config(args)
+    parser = argparse.ArgumentParser(description='3D Autoencoder Anomaly Detection for BRATS')
+    parser.add_argument('--subjects', type=int, default=10,
+                        help='Number of subjects to process (default: 10)')
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='Number of training epochs (default: 50)')
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Batch size for training (default: 8)')
+    parser.add_argument('--patch_size', type=int, nargs=3, default=[32, 32, 32],
+                        help='3D patch size (default: 32 32 32)')
+    parser.add_argument('--data_path', type=str, default=".",
+                        help='Path to BRATS data (default: current directory)')
     
-    # Set seed for reproducibility
-    set_seed(config.seed)
+    args = parser.parse_args()
     
-    # Create output directory
-    Path(config.output_dir).mkdir(exist_ok=True)
+    print("3D Autoencoder Anomaly Detection for BRATS Dataset")
+    print("=" * 55)
+    print(f"Framework: {FRAMEWORK.upper()}")
+    print(f"Subjects to process: {args.subjects}")
+    print(f"Training epochs: {args.epochs}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Patch size: {args.patch_size}")
+    print(f"Data path: {args.data_path}")
     
-    logger.info("Starting BraTS Anomaly Detection with 3D Autoencoder")
-    logger.info(f"Using device: {config.device}")
-    logger.info(f"Configuration: {vars(config)}")
+    # Initialize data processor
+    processor = BRATSDataProcessor(
+        data_path=args.data_path,
+        patch_size=tuple(args.patch_size),
+        stride=16
+    )
     
-    # Process dataset
-    processor = BraTSDataProcessor(config)
-    patches, labels = processor.process_dataset()
-    
-    if len(patches) == 0:
-        logger.error("No patches extracted! Check dataset path and parameters.")
+    # Prepare data
+    try:
+        train_healthy, test_healthy, test_abnormal = processor.prepare_data(args.subjects)
+    except Exception as e:
+        print(f"Error preparing data: {e}")
         return
     
-    logger.info(f"Dataset shape: {patches.shape}")
-    logger.info(f"Labels shape: {labels.shape}")
-    
-    # Split dataset
-    dataset = BraTSDataset(patches, labels)
-    
-    # For training, we only use normal patches (label = 0)
-    normal_indices = np.where(labels == 0)[0]
-    anomaly_indices = np.where(labels == 1)[0]
-    
-    # Split normal patches for training/validation
-    train_size = int(len(normal_indices) * config.train_ratio)
-    train_indices = normal_indices[:train_size]
-    val_indices = normal_indices[train_size:]
-    
-    # Create datasets
-    train_patches = patches[train_indices]
-    val_patches = patches[val_indices]
-    
-    train_dataset = BraTSDataset(train_patches)
-    val_dataset = BraTSDataset(val_patches)
-    
-    # Test dataset includes both normal and anomaly patches
-    test_indices = np.concatenate([val_indices, anomaly_indices])
-    test_patches = patches[test_indices]
-    test_labels = labels[test_indices]
-    test_dataset = BraTSDataset(test_patches, test_labels)
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset, 
-        batch_size=config.batch_size, 
-        shuffle=True,
-        num_workers=config.num_workers,
-        pin_memory=True if config.device.type == 'cuda' else False
-    )
-    
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=config.batch_size, 
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True if config.device.type == 'cuda' else False
-    )
-    
-    test_loader = DataLoader(
-        test_dataset, 
-        batch_size=config.batch_size, 
-        shuffle=False,
-        num_workers=config.num_workers,
-        pin_memory=True if config.device.type == 'cuda' else False
-    )
-    
-    logger.info(f"Training samples: {len(train_dataset)}")
-    logger.info(f"Validation samples: {len(val_dataset)}")
-    logger.info(f"Test samples: {len(test_dataset)} (Normal: {np.sum(test_labels == 0)}, Anomaly: {np.sum(test_labels == 1)})")
-    
-    # Create model
-    model = Autoencoder3D(input_channels=4, latent_dim=config.latent_dim)
-    
-    # Create trainer
-    trainer = Trainer(model, config)
+    print(f"\nDataset split:")
+    print(f"  Training (healthy): {len(train_healthy)}")
+    print(f"  Testing (healthy): {len(test_healthy)}")
+    print(f"  Testing (abnormal): {len(test_abnormal)}")
     
     # Train model
-    trainer.train(train_loader, val_loader)
+    if FRAMEWORK == 'pytorch':
+        model, losses = train_pytorch_model(
+            train_healthy, epochs=args.epochs, 
+            batch_size=args.batch_size
+        )
+        healthy_errors, abnormal_errors = evaluate_pytorch_model(
+            model, test_healthy, test_abnormal
+        )
+    else:
+        model, losses = train_tensorflow_model(
+            train_healthy, epochs=args.epochs, 
+            batch_size=args.batch_size
+        )
+        healthy_errors, abnormal_errors = evaluate_tensorflow_model(
+            model, test_healthy, test_abnormal
+        )
     
-    # Create visualizer
-    if config.visualize:
-        visualizer = Visualizer(config)
-        
-        # Plot training curves
-        visualizer.plot_training_curves(trainer.train_losses, trainer.val_losses)
-        
-        # Visualize sample patches
-        sample_indices = np.random.choice(len(patches), min(5, len(patches)), replace=False)
-        visualizer.visualize_3d_patches(patches[sample_indices], labels[sample_indices])
+    # Store training losses globally for visualization
+    global training_losses
+    training_losses = losses
     
-    # Anomaly detection evaluation
-    detector = AnomalyDetector(model, config)
-    results = detector.evaluate(test_loader)
+    # Calculate metrics and create visualizations
+    results = calculate_metrics_and_visualize(healthy_errors, abnormal_errors)
     
-    # Create visualizations
-    if config.visualize and results['true_labels'] is not None:
-        visualizer.plot_confusion_matrix(results['confusion_matrix'])
-        visualizer.plot_roc_curve(results['true_labels'], 
-                                 results['reconstruction_errors'], 
-                                 results['roc_auc'])
-        visualizer.plot_precision_recall_curve(results['true_labels'], 
-                                              results['reconstruction_errors'], 
-                                              results['average_precision'])
-        visualizer.plot_reconstruction_error_histogram(results['reconstruction_errors'], 
-                                                      results['true_labels'], 
-                                                      results['optimal_threshold'])
-        
-        # Latent space visualization
-        if len(results['latent_features']) >= 50:
-            visualizer.plot_latent_space_projection(results['latent_features'], 
-                                                   results['true_labels'], 
-                                                   method='tsne')
-            visualizer.plot_latent_space_projection(results['latent_features'], 
-                                                   results['true_labels'], 
-                                                   method='pca')
-        
-        # Summary plot
-        visualizer.create_summary_plot(results)
-    
-    logger.info("Analysis completed successfully!")
-    logger.info(f"Results saved to: {config.output_dir}")
+    print("\nAnalysis complete! Check the generated plots for detailed results.")
 
 
 if __name__ == "__main__":
