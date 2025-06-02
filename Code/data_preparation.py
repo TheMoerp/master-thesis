@@ -58,27 +58,72 @@ def prepare_ribfrac_dataset(data_dir="datasets", output_dir=None, cache_rate=0.0
         lbl_id = os.path.basename(lbl_path).split('-')[0]
         
         if img_id == lbl_id:
+            # Extract case ID number
+            # RibFrac123 -> 123
+            case_id = int(img_id.replace("RibFrac", ""))
+            
+            # Artificially designate half of the dataset as "normal" and half as "fracture"
+            # For demonstration, we'll consider first half as normal, second half as fracture
+            # This is artificial but allows us to test the anomaly detection approach
+            has_fracture = case_id > 150  # Arbitrary split
+            
             data_dict = {
                 "image": img_path,
-                "label": lbl_path
+                "label": lbl_path,
+                "has_fracture": has_fracture
             }
             data_dicts.append(data_dict)
     
     print(f"Successfully paired {len(data_dicts)} image-label pairs")
     
+    # Count how many fracture and normal cases we have
+    fracture_count = sum(1 for d in data_dicts if d["has_fracture"])
+    normal_count = sum(1 for d in data_dicts if not d["has_fracture"])
+    print(f"Total count: {len(data_dicts)} images - {fracture_count} fracture cases, {normal_count} normal cases")
+    
     # Split into training, validation and test sets (70/15/15)
-    np.random.shuffle(data_dicts)
-    n_total = len(data_dicts)
-    n_train = int(0.7 * n_total)
-    n_val = int(0.15 * n_total)
+    # Ensure we have a balanced test set with both normal and fracture cases
+    fracture_dicts = [d for d in data_dicts if d["has_fracture"]]
+    normal_dicts = [d for d in data_dicts if not d["has_fracture"]]
     
-    train_files = data_dicts[:n_train]
-    val_files = data_dicts[n_train:n_train+n_val]
-    test_files = data_dicts[n_train+n_val:]
+    # Shuffle both lists
+    np.random.shuffle(fracture_dicts)
+    np.random.shuffle(normal_dicts)
     
-    print(f"Training files: {len(train_files)}")
-    print(f"Validation files: {len(val_files)}")
-    print(f"Testing files: {len(test_files)}")
+    # Calculate number of samples for each set while ensuring balance in test set
+    n_fracture = len(fracture_dicts)
+    n_normal = len(normal_dicts)
+    
+    # For test set, take equal numbers of normal and fracture cases (up to 15 of each)
+    n_test_per_class = min(15, min(n_fracture, n_normal) // 3)
+    
+    # For validation, take up to 15 of each as well
+    n_val_per_class = min(15, min(n_fracture, n_normal) // 3)
+    
+    # Rest goes to training
+    test_fracture = fracture_dicts[:n_test_per_class]
+    test_normal = normal_dicts[:n_test_per_class]
+    
+    val_fracture = fracture_dicts[n_test_per_class:n_test_per_class+n_val_per_class]
+    val_normal = normal_dicts[n_test_per_class:n_test_per_class+n_val_per_class]
+    
+    train_fracture = fracture_dicts[n_test_per_class+n_val_per_class:]
+    train_normal = normal_dicts[n_test_per_class+n_val_per_class:]
+    
+    # Combine and shuffle
+    train_files = train_fracture + train_normal
+    val_files = val_fracture + val_normal
+    test_files = test_fracture + test_normal
+    
+    np.random.shuffle(train_files)
+    np.random.shuffle(val_files)
+    np.random.shuffle(test_files)
+    
+    # Use all available images (removed the limit of 60 samples)
+    
+    print(f"Using {len(train_files)} training samples ({len(train_fracture)} fracture, {len(train_normal)} normal)")
+    print(f"Using {len(val_files)} validation samples ({len(val_fracture)} fracture, {len(val_normal)} normal)")
+    print(f"Using {len(test_files)} testing samples ({len(test_fracture)} fracture, {len(test_normal)} normal)")
     
     # Define the data transforms
     train_transforms = Compose([
@@ -102,7 +147,7 @@ def prepare_ribfrac_dataset(data_dir="datasets", output_dir=None, cache_rate=0.0
             spatial_size=(96, 96, 96),  # 3D patches
             pos=1,
             neg=1,
-            num_samples=4,
+            num_samples=1,  # Changed from 4 to 1 for quicker testing
             image_key="image",
             image_threshold=0,
         ),

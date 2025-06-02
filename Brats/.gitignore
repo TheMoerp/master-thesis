@@ -7,3 +7,6 @@ __pycache__/
 *.pth.tar.gz
 datasets/
 BraTS*
+anatomix/
+anatomix_ae_results/
+env_packages/

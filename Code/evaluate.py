@@ -277,7 +277,7 @@ def main(args):
     model = AutoEncoder3D(
         in_channels=1,
         out_channels=1,
-        features=[16, 32, 64, 128, 256]
+        features=[16, 32, 64]
     )
     
     # Load trained model
@@ -300,11 +300,11 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate 3D autoencoder for rib fracture anomaly detection")
-    parser.add_argument("--data_dir", type=str, default="./ribfrac-dataset", help="Path to RibFrac dataset")
+    parser.add_argument("--data_dir", type=str, default="datasets", help="Path to RibFrac dataset")
     parser.add_argument("--checkpoint_path", type=str, default="./checkpoints/best_model.pth", help="Path to model checkpoint")
     parser.add_argument("--output_dir", type=str, default="./evaluation_results", help="Directory to save evaluation results")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
-    parser.add_argument("--cache_rate", type=float, default=1.0, help="Cache rate for dataset")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
+    parser.add_argument("--cache_rate", type=float, default=0.5, help="Cache rate for dataset")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no_cuda", action="store_true", help="Disable CUDA")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of workers for dataset preparation")

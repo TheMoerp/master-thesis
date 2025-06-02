@@ -1,0 +1,8 @@
+2025-05-23 15:23:46,981 - INFO - Starting 3D Autoencoder Anomaly Detection for BraTS Dataset
+2025-05-23 15:23:46,982 - INFO - Configuration: {'dataset_path': './datasets/BraTS2025-GLI-PRE-Challenge-TrainingData', 'output_dir': './ae_brats2_results', 'patch_size': (32, 32, 32), 'patches_per_volume': 50, 'min_brain_threshold': 0.1, 'max_tumor_threshold': 0.05, 'batch_size': 16, 'num_epochs': 100, 'learning_rate': 0.001, 'weight_decay': 1e-05, 'early_stopping_patience': 15, 'latent_dim': 128, 'dropout_rate': 0.2, 'test_split': 0.2, 'random_seed': 42, 'visualize_patches': True, 'num_samples_to_visualize': 5, 'tsne_n_components': 2, 'tsne_perplexity': 30}
+2025-05-23 15:23:46,982 - INFO - Using device: cuda
+2025-05-23 15:23:46,983 - INFO - Preparing data...
+2025-05-23 15:23:48,747 - INFO - Discovered 2 subjects
+2025-05-23 15:23:48,747 - INFO - Extracting patches from 2 subjects...
+2025-05-23 15:23:51,618 - INFO - Total patches extracted: 0
+2025-05-23 15:23:51,619 - ERROR - Pipeline failed with error: No patches were extracted!

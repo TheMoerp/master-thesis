@@ -103,7 +103,7 @@ def train_model(
         val_steps = 0
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation"):
+            for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validation")):
                 images = batch["image"].to(device)
                 
                 # Forward pass
@@ -208,7 +208,7 @@ def main(args):
     model = AutoEncoder3D(
         in_channels=1,
         out_channels=1,
-        features=[16, 32, 64, 128, 256]
+        features=[16, 32, 64]
     )
     
     # Train model
@@ -249,9 +249,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train 3D Autoencoder for RibFrac")
     parser.add_argument("--data_dir", type=str, default="datasets",
                       help="Path to the dataset directory")
-    parser.add_argument("--batch_size", type=int, default=1,
+    parser.add_argument("--batch_size", type=int, default=4,
                       help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=100,
+    parser.add_argument("--epochs", type=int, default=30,
                       help="Number of epochs to train")
     parser.add_argument("--lr", type=float, default=1e-4,
                       help="Learning rate")
@@ -265,9 +265,9 @@ if __name__ == "__main__":
                       help="Directory to save checkpoints")
     parser.add_argument("--threshold_percentile", type=float, default=95, 
                       help="Percentile for anomaly threshold")
-    parser.add_argument("--cache_rate", type=float, default=0.0,
+    parser.add_argument("--cache_rate", type=float, default=0.5,
                       help="Cache rate for MONAI CacheDataset (0.0-1.0)")
-    parser.add_argument("--num_workers", type=int, default=2,
+    parser.add_argument("--num_workers", type=int, default=4,
                       help="Number of workers for data loading")
     
     args = parser.parse_args()
