@@ -1,7 +1,0 @@
-Patch-level metrics:
-AUC: 0.6637
-Average Precision: 0.4861
-Optimal threshold: 0.078126
-
-Patient-level metrics:
-Mean patient AUC: 0.8038

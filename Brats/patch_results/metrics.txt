@@ -1,5 +1,0 @@
-Train Patients: ['BraTS-GLI-00000-000', 'BraTS-GLI-00002-000']
-Test Patients: ['BraTS-GLI-01665-000', 'BraTS-GLI-01666-000']
-
-TEST Mean AUC: 0.5000
-TEST Mean AP: 0.0199
