@@ -5,16 +5,16 @@ DATA LEAKAGE PREVENTION MEASURES:
 - Threshold determined using ONLY normal validation data
 - No test label access during threshold selection
 ============================================================
-ROC AUC:           0.8331
-Average Precision: 0.8077
-Matthews Correlation: 0.2700
-Balanced Accuracy: 0.5794
-F1 Score:          0.2881
-Precision:         0.9444
-Recall:            0.1700
-Specificity:       0.9888
-Accuracy:          0.5556
-Threshold Used:    0.050154
+ROC AUC:           0.7726
+Average Precision: 0.7348
+Matthews Correlation: 0.3919
+Balanced Accuracy: 0.6575
+F1 Score:          0.5161
+Precision:         0.8111
+Recall:            0.3784
+Specificity:       0.9365
+Accuracy:          0.7028
+Threshold Used:    0.020776
 ============================================================
 Configuration:
   Patch size: 32
@@ -23,9 +23,9 @@ Configuration:
   Learning rate: 5e-05
   Batch size: 8
   Number of epochs: 100
-  Training samples: 294
-  Validation samples: 108
-  Test samples: 189
-  Training subjects: 6
-  Validation subjects: 2
-  Test subjects: 2
+  Training samples: 33278
+  Validation samples: 11044
+  Test samples: 19021
+  Training subjects: 480
+  Validation subjects: 160
+  Test subjects: 160

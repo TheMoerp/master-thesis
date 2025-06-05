@@ -85,13 +85,6 @@ class Config:
         self.max_normal_patches_per_subject = 100  # Maximum normal patches per subject
         self.max_anomaly_patches_per_subject = 50  # Maximum anomaly patches per subject
         
-        # IMPROVED: Brain tissue quality parameters for better patch selection
-        self.min_brain_tissue_ratio = 0.85  # Minimum 85% of patch should be brain tissue (non-zero)
-        self.min_intensity_threshold = 0.1  # Minimum intensity to consider as brain tissue
-        self.max_background_ratio = 0.15  # Maximum 15% of patch can be background/edge
-        self.brain_tissue_percentile_min = 0.3  # Use robust intensity thresholds
-        self.edge_exclusion_margin = 5  # Exclude patches too close to volume edges
-        
         # Model parameters
         self.latent_dim = 256  # Increased latent dimension for better representation
         self.learning_rate = 5e-5  # Reduced learning rate for more stable training
@@ -329,85 +322,9 @@ class BraTSDataProcessor:
             
         return volume
     
-    def is_high_quality_brain_patch(self, patch: np.ndarray, volume_shape: tuple, 
-                                   patch_coords: tuple) -> bool:
-        """
-        Check if patch contains sufficient brain tissue and minimal background/edge regions
-        
-        Args:
-            patch: The 3D patch to evaluate
-            volume_shape: Shape of the original volume (for edge detection)
-            patch_coords: (x_start, y_start, z_start, x_end, y_end, z_end) coordinates
-            
-        Returns:
-            bool: True if patch meets brain tissue quality criteria
-        """
-        x_start, y_start, z_start, x_end, y_end, z_end = patch_coords
-        
-        # 1. Edge proximity check - exclude patches too close to volume boundaries
-        margin = self.config.edge_exclusion_margin
-        if (x_start < margin or y_start < margin or z_start < margin or
-            x_end > volume_shape[0] - margin or 
-            y_end > volume_shape[1] - margin or 
-            z_end > volume_shape[2] - margin):
-            return False
-        
-        # 2. Brain tissue content check
-        # Calculate different intensity thresholds
-        non_zero_mask = patch > 0
-        non_zero_ratio = np.sum(non_zero_mask) / patch.size
-        
-        # Check if sufficient non-zero content
-        if non_zero_ratio < self.config.min_brain_tissue_ratio:
-            return False
-        
-        # 3. Intensity-based brain tissue detection
-        # Use percentile-based threshold for robust brain tissue detection
-        if np.sum(non_zero_mask) > 0:
-            non_zero_values = patch[non_zero_mask]
-            intensity_threshold = np.percentile(non_zero_values, 
-                                              self.config.brain_tissue_percentile_min * 100)
-            intensity_threshold = max(intensity_threshold, self.config.min_intensity_threshold)
-            
-            # Calculate brain tissue ratio using adaptive threshold
-            brain_tissue_mask = patch > intensity_threshold
-            brain_tissue_ratio = np.sum(brain_tissue_mask) / patch.size
-            
-            if brain_tissue_ratio < self.config.min_brain_tissue_ratio:
-                return False
-        
-        # 4. Background/edge ratio check
-        background_ratio = 1.0 - non_zero_ratio
-        if background_ratio > self.config.max_background_ratio:
-            return False
-        
-        # 5. Additional quality checks
-        # Check for sufficient intensity variation (avoid uniform regions)
-        if patch.std() < self.config.min_patch_std:
-            return False
-        
-        # Check for sufficient mean intensity (avoid mostly dark regions)
-        if patch.mean() < self.config.min_patch_mean:
-            return False
-        
-        # 6. Spatial distribution check - avoid patches with all intensity at edges
-        # Check center region has sufficient intensity
-        center_margin = self.config.patch_size // 4
-        center_patch = patch[center_margin:-center_margin, 
-                           center_margin:-center_margin, 
-                           center_margin:-center_margin]
-        
-        if center_patch.size > 0:
-            center_non_zero_ratio = np.sum(center_patch > self.config.min_intensity_threshold) / center_patch.size
-            if center_non_zero_ratio < 0.5:  # At least 50% of center should be brain tissue
-                return False
-        
-        return True
-    
     def extract_normal_patches(self, volume: np.ndarray, segmentation: np.ndarray) -> List[np.ndarray]:
         """
         Extract normal patches from regions without tumor (label 0)
-        with improved brain tissue quality validation
         """
         patches = []
         
@@ -432,9 +349,6 @@ class BraTSDataProcessor:
                        for i in indices]
         
         # Extract patches with progress bar
-        quality_passed = 0
-        quality_failed = 0
-        
         for x, y, z in tqdm(patch_coords, desc="Extracting normal patches", leave=False):
             # Calculate patch boundaries
             x_start = max(0, x - self.config.patch_size // 2)
@@ -460,31 +374,20 @@ class BraTSDataProcessor:
             
             patch = volume[x_start:x_end, y_start:y_end, z_start:z_end]
             
-            # IMPROVED: Comprehensive quality checks
-            patch_coords_tuple = (x_start, y_start, z_start, x_end, y_end, z_end)
-            
-            # 1. Brain tissue quality check
-            if not self.is_high_quality_brain_patch(patch, volume.shape, patch_coords_tuple):
-                quality_failed += 1
-                continue
-            
-            # 2. Verify this is actually a normal patch (no tumor)
-            patch_seg = segmentation[x_start:x_end, y_start:y_end, z_start:z_end]
-            tumor_ratio = np.sum(patch_seg > 0) / patch_seg.size
-            
-            if tumor_ratio <= self.config.max_tumor_ratio_normal:
-                patches.append(patch)
-                quality_passed += 1
-            else:
-                quality_failed += 1
+            # Quality checks
+            if patch.std() > self.config.min_patch_std and patch.mean() > self.config.min_patch_mean:
+                # Verify this is actually a normal patch
+                patch_seg = segmentation[x_start:x_end, y_start:y_end, z_start:z_end]
+                tumor_ratio = np.sum(patch_seg > 0) / patch_seg.size
+                
+                if tumor_ratio <= self.config.max_tumor_ratio_normal:
+                    patches.append(patch)
         
-        print(f"  Normal patches: {quality_passed} passed quality checks, {quality_failed} failed")
         return patches
     
     def extract_anomalous_patches(self, volume: np.ndarray, segmentation: np.ndarray) -> List[np.ndarray]:
         """
         Extract anomalous patches from tumor regions (labels 1, 2, 4)
-        with improved brain tissue quality validation
         """
         patches = []
         
@@ -509,9 +412,6 @@ class BraTSDataProcessor:
                        for i in indices]
         
         # Extract patches with progress bar
-        quality_passed = 0
-        quality_failed = 0
-        
         for x, y, z in tqdm(patch_coords, desc="Extracting anomaly patches", leave=False):
             # Calculate patch boundaries
             x_start = max(0, x - self.config.patch_size // 2)
@@ -537,25 +437,15 @@ class BraTSDataProcessor:
             
             patch = volume[x_start:x_end, y_start:y_end, z_start:z_end]
             
-            # IMPROVED: Comprehensive quality checks
-            patch_coords_tuple = (x_start, y_start, z_start, x_end, y_end, z_end)
-            
-            # 1. Brain tissue quality check
-            if not self.is_high_quality_brain_patch(patch, volume.shape, patch_coords_tuple):
-                quality_failed += 1
-                continue
-            
-            # 2. Verify this patch contains sufficient tumor
-            patch_seg = segmentation[x_start:x_end, y_start:y_end, z_start:z_end]
-            tumor_ratio = np.sum(patch_seg > 0) / patch_seg.size
-            
-            if tumor_ratio >= self.config.min_tumor_ratio_anomaly:
-                patches.append(patch)
-                quality_passed += 1
-            else:
-                quality_failed += 1
+            # Quality checks
+            if patch.std() > self.config.min_patch_std and patch.mean() > self.config.min_patch_mean:
+                # Verify this patch contains tumor
+                patch_seg = segmentation[x_start:x_end, y_start:y_end, z_start:z_end]
+                tumor_ratio = np.sum(patch_seg > 0) / patch_seg.size
+                
+                if tumor_ratio >= self.config.min_tumor_ratio_anomaly:
+                    patches.append(patch)
         
-        print(f"  Anomaly patches: {quality_passed} passed quality checks, {quality_failed} failed")
         return patches
     
     def process_dataset(self, num_subjects: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
