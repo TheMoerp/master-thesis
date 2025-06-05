@@ -2,16 +2,23 @@
 """
 3D Autoencoder-based Anomaly Detection for BraTS Dataset
 
-This program implements a 3D Convolutional Autoencoder for anomaly detection on the BraTS dataset.
-It extracts normal 3D patches (cubes) without tumor information for training, then evaluates 
-the model's ability to detect anomalies.
+This program implements a 3D Convolutional Autoencoder for UNSUPERVISED anomaly detection 
+on the BraTS dataset. The autoencoder is trained ONLY on normal patches (without tumor) 
+and learns to reconstruct normal brain tissue patterns. High reconstruction errors indicate 
+anomalies (tumors).
+
+CORRECTED APPROACH:
+- Training: Only normal patches (unsupervised learning)
+- Validation: Only normal patches (monitor overfitting)
+- Testing: Mixed normal + anomalous patches (evaluate detection performance)
+- Detection: Reconstruction error threshold determines anomalies
 
 Features:
-- 3D patch extraction from volumes without tumor information
-- Train/test split (80:20)
+- Proper unsupervised anomaly detection methodology
+- 3D patch extraction from volumes with quality validation
 - GPU acceleration for all compute-intensive operations
 - Real progress bars during training
-- Comprehensive evaluation metrics
+- Comprehensive evaluation metrics for anomaly detection
 - Multiple visualization options
 - Configurable parameters via command line arguments
 """
@@ -441,8 +448,8 @@ class BraTSDataProcessor:
         
         return patches
     
-    def process_dataset(self, num_subjects: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """Process the BraTS dataset and extract patches"""
+    def process_dataset(self, num_subjects: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        """Process the BraTS dataset and extract patches with subject tracking"""
         
         # Get list of subjects
         subject_dirs = [d for d in os.listdir(self.config.dataset_path) 
@@ -455,6 +462,8 @@ class BraTSDataProcessor:
         
         all_normal_patches = []
         all_anomalous_patches = []
+        all_normal_subjects = []  # Track which subject each patch comes from
+        all_anomalous_subjects = []
         
         for subject_dir in tqdm(subject_dirs, desc="Processing subjects"):
             subject_path = os.path.join(self.config.dataset_path, subject_dir)
@@ -473,8 +482,12 @@ class BraTSDataProcessor:
                 normal_patches = self.extract_normal_patches(volume, segmentation)
                 anomalous_patches = self.extract_anomalous_patches(volume, segmentation)
                 
+                # Add patches and track subjects
                 all_normal_patches.extend(normal_patches)
+                all_normal_subjects.extend([subject_dir] * len(normal_patches))
+                
                 all_anomalous_patches.extend(anomalous_patches)
+                all_anomalous_subjects.extend([subject_dir] * len(anomalous_patches))
                 
             except Exception as e:
                 continue
@@ -488,18 +501,20 @@ class BraTSDataProcessor:
         if len(all_normal_patches) > max_normal:
             indices = np.random.choice(len(all_normal_patches), max_normal, replace=False)
             all_normal_patches = [all_normal_patches[i] for i in indices]
+            all_normal_subjects = [all_normal_subjects[i] for i in indices]
         
         print(f"Final dataset: {len(all_normal_patches)} normal, {len(all_anomalous_patches)} anomalous patches")
         
         # Combine patches and create labels
         all_patches = all_normal_patches + all_anomalous_patches
         labels = [0] * len(all_normal_patches) + [1] * len(all_anomalous_patches)
+        subjects = all_normal_subjects + all_anomalous_subjects
         
         # Convert to numpy arrays (DO NOT add channel dimension here - Dataset class handles it)
         patches_array = np.array(all_patches, dtype=np.float32)
         labels_array = np.array(labels, dtype=np.int64)
         
-        return patches_array, labels_array
+        return patches_array, labels_array, subjects
 
     def validate_patch_quality(self, patches: np.ndarray, labels: np.ndarray, 
                               sample_segmentations: List[np.ndarray] = None) -> Dict:
@@ -556,7 +571,7 @@ class AnomalyDetector:
         self.scaler = GradScaler()
         
     def train(self, train_loader: DataLoader, val_loader: DataLoader):
-        """Train the autoencoder with progress tracking across all epochs"""
+        """Train the autoencoder ONLY on normal data for proper anomaly detection"""
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config.learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
@@ -569,14 +584,29 @@ class AnomalyDetector:
         
         total_steps = self.config.num_epochs * len(train_loader)
         
+        print("TRAINING MODE: Autoencoder will be trained ONLY on normal data (unsupervised)")
+        print("Anomalous data will be used ONLY for testing, not training")
+        
         with tqdm(total=total_steps, desc="Training Progress") as pbar:
             for epoch in range(self.config.num_epochs):
-                # Training phase
+                # Training phase - ONLY on normal data
                 self.model.train()
                 train_loss = 0.0
+                normal_samples_processed = 0
                 
-                for batch_idx, (normal_data, _) in enumerate(train_loader):
-                    normal_data = normal_data.to(self.config.device)
+                for batch_idx, (data, labels) in enumerate(train_loader):
+                    data = data.to(self.config.device)
+                    labels = labels.to(self.config.device)
+                    
+                    # CRITICAL FIX: Only use normal samples (label = 0) for training
+                    normal_mask = (labels == 0).squeeze()
+                    
+                    if normal_mask.sum() == 0:  # Skip if no normal samples in batch
+                        pbar.update(1)
+                        continue
+                    
+                    normal_data = data[normal_mask]
+                    normal_samples_processed += normal_data.size(0)
                     
                     optimizer.zero_grad()
                     
@@ -592,19 +622,31 @@ class AnomalyDetector:
                     pbar.update(1)
                     pbar.set_postfix({
                         'Epoch': f'{epoch+1}/{self.config.num_epochs}',
-                        'Loss': f'{loss.item():.6f}'
+                        'Loss': f'{loss.item():.6f}',
+                        'Normal_samples': normal_samples_processed
                     })
                 
-                avg_train_loss = train_loss / len(train_loader)
+                avg_train_loss = train_loss / len(train_loader) if len(train_loader) > 0 else 0
                 train_losses.append(avg_train_loss)
                 
-                # Validation phase
+                # Validation phase - ONLY on normal data
                 self.model.eval()
                 val_loss = 0.0
+                val_normal_samples = 0
                 
                 with torch.no_grad():
-                    for normal_data, _ in val_loader:
-                        normal_data = normal_data.to(self.config.device)
+                    for data, labels in val_loader:
+                        data = data.to(self.config.device)
+                        labels = labels.to(self.config.device)
+                        
+                        # Only validate on normal samples
+                        normal_mask = (labels == 0).squeeze()
+                        
+                        if normal_mask.sum() == 0:
+                            continue
+                            
+                        normal_data = data[normal_mask]
+                        val_normal_samples += normal_data.size(0)
                         
                         with autocast():
                             reconstructed, _ = self.model(normal_data)
@@ -612,10 +654,16 @@ class AnomalyDetector:
                         
                         val_loss += loss.item()
                 
-                avg_val_loss = val_loss / len(val_loader)
+                avg_val_loss = val_loss / len(val_loader) if len(val_loader) > 0 else 0
                 val_losses.append(avg_val_loss)
                 
                 scheduler.step(avg_val_loss)
+                
+                # Print epoch summary
+                if (epoch + 1) % 10 == 0:
+                    print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
+                    print(f"Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
+                    print(f"Normal samples processed: Train={normal_samples_processed}, Val={val_normal_samples}")
                 
                 # Early stopping
                 if avg_val_loss < best_val_loss:
@@ -629,6 +677,9 @@ class AnomalyDetector:
                 if patience_counter >= self.config.early_stopping_patience:
                     pbar.write(f"Early stopping triggered after {epoch+1} epochs")
                     break
+        
+        print(f"\nTraining completed. Model trained on normal data only.")
+        print(f"Best validation loss: {best_val_loss:.6f}")
         
         # Save training history
         self.save_training_plots(train_losses, val_losses)
@@ -672,197 +723,172 @@ class AnomalyDetector:
         
         return np.array(reconstruction_errors), np.array(true_labels), np.array(latent_features)
     
-    def find_optimal_threshold(self, reconstruction_errors: np.ndarray, true_labels: np.ndarray) -> float:
-        """Find optimal threshold for anomaly detection using multiple metrics"""
-        # Get error statistics
-        normal_errors = reconstruction_errors[true_labels == 0]
-        anomaly_errors = reconstruction_errors[true_labels == 1]
+    def find_unsupervised_threshold(self, val_loader: DataLoader) -> float:
+        """Find threshold using ONLY normal validation data (no test label access)"""
+        print(f"\nUNSUPERVISED THRESHOLD DETERMINATION (No Test Label Access)")
+        print(f"{'='*60}")
+        print("Computing threshold using ONLY normal validation data...")
         
-        print(f"\nReconstruction Error Statistics:")
-        print(f"Normal patches - Mean: {normal_errors.mean():.6f}, Std: {normal_errors.std():.6f}")
-        print(f"Normal patches - Min: {normal_errors.min():.6f}, Max: {normal_errors.max():.6f}")
-        print(f"Anomaly patches - Mean: {anomaly_errors.mean():.6f}, Std: {anomaly_errors.std():.6f}")
-        print(f"Anomaly patches - Min: {anomaly_errors.min():.6f}, Max: {anomaly_errors.max():.6f}")
+        # Calculate reconstruction errors on validation set (only normal data)
+        self.model.eval()
+        normal_val_errors = []
         
-        # Create more sophisticated threshold candidates
-        # Include percentiles of normal data and statistical thresholds
-        normal_percentiles = np.percentile(normal_errors, [50, 75, 90, 95, 99])
-        statistical_thresholds = [
-            normal_errors.mean() + normal_errors.std(),
-            normal_errors.mean() + 2 * normal_errors.std(),
-            normal_errors.mean() + 3 * normal_errors.std()
-        ]
-        
-        # Linear space between min and max errors
-        linear_thresholds = np.linspace(reconstruction_errors.min(), reconstruction_errors.max(), 100)
-        
-        # Combine all threshold candidates
-        thresholds = np.concatenate([normal_percentiles, statistical_thresholds, linear_thresholds])
-        thresholds = np.unique(thresholds)  # Remove duplicates
-        
-        best_threshold = 0
-        best_f1 = 0
-        best_balanced_accuracy = 0
-        results = []
-        
-        for threshold in thresholds:
-            predictions = (reconstruction_errors > threshold).astype(int)
-            
-            # Skip if all predictions are the same class
-            if len(np.unique(predictions)) < 2:
-                continue
+        with torch.no_grad():
+            for data, labels in tqdm(val_loader, desc="Computing validation errors"):
+                data = data.to(self.config.device)
+                labels = labels.to(self.config.device)
                 
-            try:
-                f1 = f1_score(true_labels, predictions)
-                precision = precision_score(true_labels, predictions)
-                recall = recall_score(true_labels, predictions)
-                accuracy = accuracy_score(true_labels, predictions)
-                
-                # Calculate balanced accuracy (better for imbalanced data)
-                tn = np.sum((true_labels == 0) & (predictions == 0))
-                fp = np.sum((true_labels == 0) & (predictions == 1))
-                fn = np.sum((true_labels == 1) & (predictions == 0))
-                tp = np.sum((true_labels == 1) & (predictions == 1))
-                
-                sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
-                specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-                balanced_accuracy = (sensitivity + specificity) / 2
-                
-                results.append({
-                    'threshold': threshold,
-                    'f1': f1,
-                    'precision': precision,
-                    'recall': recall,
-                    'accuracy': accuracy,
-                    'balanced_accuracy': balanced_accuracy,
-                    'sensitivity': sensitivity,
-                    'specificity': specificity
-                })
-                
-                # Primary criterion: F1 score, secondary: balanced accuracy
-                if f1 > best_f1 or (f1 == best_f1 and balanced_accuracy > best_balanced_accuracy):
-                    best_f1 = f1
-                    best_balanced_accuracy = balanced_accuracy
-                    best_threshold = threshold
+                # Only use normal samples (should be all in val set anyway)
+                normal_mask = (labels == 0).squeeze()
+                if normal_mask.sum() == 0:
+                    continue
                     
-            except:
-                continue
+                normal_data = data[normal_mask]
+                
+                with autocast():
+                    reconstructed, _ = self.model(normal_data)
+                    
+                # Calculate MSE for each sample
+                mse = torch.mean((normal_data - reconstructed) ** 2, dim=(1, 2, 3, 4))
+                normal_val_errors.extend(mse.cpu().numpy())
         
-        # Print top 5 threshold candidates
-        if results:
-            results_df = pd.DataFrame(results)
-            results_df = results_df.sort_values('f1', ascending=False)
-            print(f"\nTop 5 threshold candidates:")
-            print(results_df.head().to_string(index=False))
+        normal_val_errors = np.array(normal_val_errors)
         
-        print(f"\nSelected threshold: {best_threshold:.6f} (F1: {best_f1:.4f}, Balanced Accuracy: {best_balanced_accuracy:.4f})")
+        print(f"Normal validation errors - Count: {len(normal_val_errors)}")
+        print(f"Normal validation errors - Mean: {normal_val_errors.mean():.6f}, Std: {normal_val_errors.std():.6f}")
+        print(f"Normal validation errors - Min: {normal_val_errors.min():.6f}, Max: {normal_val_errors.max():.6f}")
         
-        return best_threshold
+        # Create unsupervised threshold candidates based ONLY on normal data
+        threshold_methods = {
+            'percentile_95': np.percentile(normal_val_errors, 95),
+            'percentile_97': np.percentile(normal_val_errors, 97),
+            'percentile_99': np.percentile(normal_val_errors, 99),
+            'mean_plus_2std': normal_val_errors.mean() + 2 * normal_val_errors.std(),
+            'mean_plus_3std': normal_val_errors.mean() + 3 * normal_val_errors.std(),
+            'median_plus_2mad': np.median(normal_val_errors) + 2 * np.median(np.abs(normal_val_errors - np.median(normal_val_errors))),
+            'iqr_outlier': np.percentile(normal_val_errors, 75) + 1.5 * (np.percentile(normal_val_errors, 75) - np.percentile(normal_val_errors, 25))
+        }
+        
+        print(f"\nUNSUPERVISED THRESHOLD CANDIDATES:")
+        print(f"{'Method':<20} {'Threshold':<12}")
+        print(f"{'-'*35}")
+        for method, threshold in threshold_methods.items():
+            print(f"{method:<20} {threshold:<12.6f}")
+        
+        # Use 95th percentile as default (common practice in anomaly detection)
+        selected_threshold = threshold_methods['percentile_95']
+        selected_method = 'percentile_95'
+        
+        print(f"\nSELECTED THRESHOLD: {selected_threshold:.6f} (Method: {selected_method})")
+        print(f"Rationale: 95th percentile of normal validation errors is a conservative,")
+        print(f"commonly used threshold that doesn't require test label access.")
+        print(f"{'='*60}")
+        
+        return selected_threshold
     
-    def evaluate(self, test_loader: DataLoader) -> Dict:
-        """Comprehensive evaluation of the model"""
-        print("Evaluating model...")
-        
+    def evaluate(self, test_loader: DataLoader, val_loader: DataLoader) -> Dict:
+        """Evaluate the autoencoder for truly unsupervised anomaly detection"""
         # Load best model
-        best_model_path = os.path.join(self.config.output_dir, 'best_autoencoder_3d.pth')
-        if os.path.exists(best_model_path):
-            self.model.load_state_dict(torch.load(best_model_path))
+        model_path = os.path.join(self.config.output_dir, 'best_autoencoder_3d.pth')
+        if os.path.exists(model_path):
+            self.model.load_state_dict(torch.load(model_path))
             print("Loaded best model for evaluation")
         
-        # Calculate reconstruction errors
+        # STEP 1: Determine threshold using ONLY normal validation data (no test label access)
+        optimal_threshold = self.find_unsupervised_threshold(val_loader)
+        
+        # STEP 2: Calculate reconstruction errors on test set
         reconstruction_errors, true_labels, latent_features = self.calculate_reconstruction_errors(test_loader)
         
-        print(f"\nEvaluation dataset statistics:")
-        print(f"Total samples: {len(reconstruction_errors)}")
-        print(f"Normal samples: {np.sum(true_labels == 0)} ({np.sum(true_labels == 0)/len(true_labels)*100:.1f}%)")
-        print(f"Anomalous samples: {np.sum(true_labels == 1)} ({np.sum(true_labels == 1)/len(true_labels)*100:.1f}%)")
+        print(f"\nEVALUATION: Truly Unsupervised Anomaly Detection Results")
+        print(f"{'='*60}")
+        print(f"Total test samples: {len(reconstruction_errors)}")
+        print(f"Normal samples: {np.sum(true_labels == 0)}")
+        print(f"Anomalous samples: {np.sum(true_labels == 1)}")
         
-        # Analyze reconstruction error distributions
-        normal_errors = reconstruction_errors[true_labels == 0]
-        anomaly_errors = reconstruction_errors[true_labels == 1]
-        
-        print(f"\nReconstruction error distribution analysis:")
-        print(f"Expected: Normal errors should be LOWER than anomaly errors")
-        print(f"Normal errors    - Mean: {normal_errors.mean():.6f} ± {normal_errors.std():.6f}")
-        print(f"Anomaly errors   - Mean: {anomaly_errors.mean():.6f} ± {anomaly_errors.std():.6f}")
-        print(f"Separation ratio - Anomaly/Normal mean: {anomaly_errors.mean()/normal_errors.mean():.3f}")
-        
-        # Check if anomaly detection makes sense
-        if anomaly_errors.mean() <= normal_errors.mean():
-            print("WARNING: Anomaly errors are not higher than normal errors!")
-            print("This suggests the model is not learning to distinguish between normal and anomalous patterns.")
-            print("Possible causes:")
-            print("1. Model architecture is too simple/complex")
-            print("2. Training data quality issues")
-            print("3. Insufficient training")
-            print("4. Poor patch extraction quality")
-        
-        # Find optimal threshold
-        optimal_threshold = self.find_optimal_threshold(reconstruction_errors, true_labels)
+        # STEP 3: Apply threshold (determined without seeing test labels)
         predictions = (reconstruction_errors > optimal_threshold).astype(int)
         
-        # Detailed prediction analysis
-        print(f"\nPrediction analysis:")
-        print(f"Threshold used: {optimal_threshold:.6f}")
-        print(f"Samples above threshold (predicted anomalous): {np.sum(predictions == 1)}")
-        print(f"Samples below threshold (predicted normal): {np.sum(predictions == 0)}")
-        
-        # Calculate metrics with error handling
+        # STEP 4: Calculate metrics - NOW it's fair because threshold was set without test labels
         try:
             roc_auc = roc_auc_score(true_labels, reconstruction_errors)
-            avg_precision = average_precision_score(true_labels, reconstruction_errors)
-        except Exception as e:
-            print(f"Error calculating AUC metrics: {e}")
-            roc_auc = 0.5
-            avg_precision = 0.5
+            average_precision = average_precision_score(true_labels, reconstruction_errors)
+        except:
+            roc_auc = 0.0
+            average_precision = 0.0
         
-        try:
-            accuracy = accuracy_score(true_labels, predictions)
-            precision = precision_score(true_labels, predictions, zero_division=0)
-            recall = recall_score(true_labels, predictions, zero_division=0)
-            f1 = f1_score(true_labels, predictions, zero_division=0)
-        except Exception as e:
-            print(f"Error calculating classification metrics: {e}")
-            accuracy = precision = recall = f1 = 0.0
+        accuracy = accuracy_score(true_labels, predictions)
+        precision = precision_score(true_labels, predictions, zero_division=0)
+        recall = recall_score(true_labels, predictions, zero_division=0)
+        f1 = f1_score(true_labels, predictions, zero_division=0)
+        
+        # Additional metrics for imbalanced anomaly detection
+        tn, fp, fn, tp = confusion_matrix(true_labels, predictions).ravel()
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        balanced_accuracy = (sensitivity + specificity) / 2
+        
+        # Matthews Correlation Coefficient
+        mcc = ((tp * tn) - (fp * fn)) / np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) if ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) > 0 else 0
+        
+        # False Positive Rate and False Negative Rate
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+        fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
+        
+        # Analyze reconstruction error distributions POST-HOC (for understanding, not optimization)
+        normal_errors = reconstruction_errors[true_labels == 0]
+        anomaly_errors = reconstruction_errors[true_labels == 1]
+        separation_ratio = anomaly_errors.mean() / normal_errors.mean() if normal_errors.mean() > 0 else 0
+        
+        print(f"\nTRULY UNSUPERVISED ANOMALY DETECTION PERFORMANCE:")
+        print(f"{'='*60}")
+        print(f"ROC AUC:                  {roc_auc:.4f}")
+        print(f"Average Precision (AP):   {average_precision:.4f}")
+        print(f"Matthews Correlation:     {mcc:.4f}")
+        print(f"Balanced Accuracy:        {balanced_accuracy:.4f}")
+        print(f"F1 Score:                 {f1:.4f}")
+        print(f"Precision:                {precision:.4f}")
+        print(f"Recall (Sensitivity):     {recall:.4f}")
+        print(f"Specificity:              {specificity:.4f}")
+        print(f"Accuracy:                 {accuracy:.4f}")
+        print(f"False Positive Rate:      {fpr:.4f}")
+        print(f"False Negative Rate:      {fnr:.4f}")
+        print(f"Threshold Used:           {optimal_threshold:.6f}")
+        print(f"{'='*60}")
+        
+        # POST-HOC analysis (for understanding only)
+        print(f"\nPOST-HOC RECONSTRUCTION ERROR ANALYSIS:")
+        print(f"Normal errors    - Mean: {normal_errors.mean():.6f}, Std: {normal_errors.std():.6f}")
+        print(f"Anomaly errors   - Mean: {anomaly_errors.mean():.6f}, Std: {anomaly_errors.std():.6f}")
+        print(f"Separation ratio - Anomaly/Normal: {separation_ratio:.3f}")
+        
+        # Detailed confusion matrix analysis
+        print(f"\nCONFUSION MATRIX ANALYSIS:")
+        print(f"True Negatives (Normal correctly identified):      {tn}")
+        print(f"False Positives (Normal misclassified as anomaly): {fp}")
+        print(f"False Negatives (Anomaly missed):                  {fn}")
+        print(f"True Positives (Anomaly correctly detected):       {tp}")
         
         results = {
-            'roc_auc': roc_auc,
-            'average_precision': avg_precision,
-            'accuracy': accuracy,
-            'precision': precision,
-            'recall': recall,
-            'f1_score': f1,
-            'optimal_threshold': optimal_threshold,
             'reconstruction_errors': reconstruction_errors,
             'true_labels': true_labels,
             'predictions': predictions,
             'latent_features': latent_features,
-            'normal_error_stats': {
-                'mean': normal_errors.mean(),
-                'std': normal_errors.std(),
-                'min': normal_errors.min(),
-                'max': normal_errors.max()
-            },
-            'anomaly_error_stats': {
-                'mean': anomaly_errors.mean(),
-                'std': anomaly_errors.std(),
-                'min': anomaly_errors.min(),
-                'max': anomaly_errors.max()
-            }
+            'optimal_threshold': optimal_threshold,
+            'roc_auc': roc_auc,
+            'average_precision': average_precision,
+            'mcc': mcc,
+            'balanced_accuracy': balanced_accuracy,
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1,
+            'sensitivity': sensitivity,
+            'specificity': specificity,
+            'fpr': fpr,
+            'fnr': fnr,
+            'confusion_matrix': {'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp}
         }
-        
-        # Print results
-        print("\n" + "="*50)
-        print("EVALUATION RESULTS")
-        print("="*50)
-        print(f"ROC AUC:           {roc_auc:.4f}")
-        print(f"Average Precision: {avg_precision:.4f}")
-        print(f"Accuracy:          {accuracy:.4f}")
-        print(f"Precision:         {precision:.4f}")
-        print(f"Recall:            {recall:.4f}")
-        print(f"F1 Score:          {f1:.4f}")
-        print(f"Optimal Threshold: {optimal_threshold:.6f}")
-        print("="*50)
         
         return results
 
@@ -1166,7 +1192,7 @@ def main():
     # Step 1: Process dataset and extract patches
     print("\n1. Processing dataset and extracting patches...")
     processor = BraTSDataProcessor(config)
-    patches, labels = processor.process_dataset(config.num_subjects)
+    patches, labels, subjects = processor.process_dataset(config.num_subjects)
     
     if len(patches) == 0:
         print("Error: No patches extracted! Please check your dataset path and structure.")
@@ -1181,7 +1207,7 @@ def main():
     processor.validate_patch_quality(patches, labels)
     
     # Step 2: Split data into train and test sets
-    print("\n2. Splitting data into train/test sets...")
+    print("\n2. Subject-level data splitting for truly unsupervised anomaly detection...")
     
     # Check if we have both classes
     unique_labels, counts = np.unique(labels, return_counts=True)
@@ -1192,44 +1218,81 @@ def main():
         print("Please check your data extraction - you need both normal and anomalous patches.")
         return
     
-    # Ensure minimum samples for stratified split
-    min_samples = min(counts)
-    if min_samples < 2:
-        print("ERROR: Insufficient samples for stratified split. Need at least 2 samples per class.")
-        print(f"Current distribution: Normal={counts[0] if 0 in unique_labels else 0}, "
-              f"Anomaly={counts[1] if 1 in unique_labels else 0}")
-        return
+    # CRITICAL FIX: Subject-level splitting to prevent patient data leakage
+    unique_subjects = list(set(subjects))
+    print(f"Total unique subjects: {len(unique_subjects)}")
     
-    X_train, X_test, y_train, y_test = train_test_split(
-        patches, labels, test_size=1-config.train_test_split, 
-        random_state=42, stratify=labels
-    )
+    # Split subjects (not patches) into train/val/test
+    np.random.shuffle(unique_subjects)
+    n_subjects = len(unique_subjects)
+    train_subjects = unique_subjects[:int(0.6 * n_subjects)]  # 60% for training
+    val_subjects = unique_subjects[int(0.6 * n_subjects):int(0.8 * n_subjects)]  # 20% for validation
+    test_subjects = unique_subjects[int(0.8 * n_subjects):]  # 20% for testing
     
-    # Further split training data for validation
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_train, y_train, test_size=config.validation_split, 
-        random_state=42, stratify=y_train
-    )
+    print(f"Subject distribution:")
+    print(f"  Training subjects: {len(train_subjects)}")
+    print(f"  Validation subjects: {len(val_subjects)}")
+    print(f"  Test subjects: {len(test_subjects)}")
     
-    print(f"Training set: {len(X_train)} patches")
-    print(f"  Normal: {np.sum(y_train == 0)}, Anomalous: {np.sum(y_train == 1)}")
-    print(f"Validation set: {len(X_val)} patches")
-    print(f"  Normal: {np.sum(y_val == 0)}, Anomalous: {np.sum(y_val == 1)}")
-    print(f"Test set: {len(X_test)} patches")
+    # Create patch-level splits based on subject assignment
+    train_indices = [i for i, subj in enumerate(subjects) if subj in train_subjects]
+    val_indices = [i for i, subj in enumerate(subjects) if subj in val_subjects]
+    test_indices = [i for i, subj in enumerate(subjects) if subj in test_subjects]
+    
+    X_train_all = patches[train_indices]
+    y_train_all = labels[train_indices]
+    
+    X_val_all = patches[val_indices]
+    y_val_all = labels[val_indices]
+    
+    X_test = patches[test_indices]
+    y_test = labels[test_indices]
+    
+    # UNSUPERVISED CONSTRAINT: Only use NORMAL patches for training and validation
+    train_normal_mask = (y_train_all == 0)
+    val_normal_mask = (y_val_all == 0)
+    
+    X_train_normal = X_train_all[train_normal_mask]
+    y_train_normal = y_train_all[train_normal_mask]
+    
+    X_val_normal = X_val_all[val_normal_mask]
+    y_val_normal = y_val_all[val_normal_mask]
+    
+    # Test set keeps both normal and anomalous (for evaluation)
+    # This is the only place where we're allowed to have anomalous data
+    
+    print(f"\n=== SUBJECT-LEVEL UNSUPERVISED ANOMALY DETECTION SPLIT ===")
+    print(f"Training set (NORMAL ONLY): {len(X_train_normal)} patches from {len(train_subjects)} subjects")
+    print(f"  Normal: {np.sum(y_train_normal == 0)}, Anomalous: {np.sum(y_train_normal == 1)}")
+    print(f"Validation set (NORMAL ONLY): {len(X_val_normal)} patches from {len(val_subjects)} subjects") 
+    print(f"  Normal: {np.sum(y_val_normal == 0)}, Anomalous: {np.sum(y_val_normal == 1)}")
+    print(f"Test set (MIXED): {len(X_test)} patches from {len(test_subjects)} subjects")
     print(f"  Normal: {np.sum(y_test == 0)}, Anomalous: {np.sum(y_test == 1)}")
+    print(f"========================================================")
+    
+    # Verify no subject appears in multiple splits
+    assert len(set(train_subjects) & set(val_subjects)) == 0, "Subject overlap between train and validation!"
+    assert len(set(train_subjects) & set(test_subjects)) == 0, "Subject overlap between train and test!"
+    assert len(set(val_subjects) & set(test_subjects)) == 0, "Subject overlap between validation and test!"
+    print("✓ No subject overlap confirmed - data leakage prevented!")
+    
+    # Create datasets with the corrected split
+    # Training: Only normal data from training subjects
+    train_dataset = BraTSPatchDataset(X_train_normal, y_train_normal)
+    # Validation: Only normal data from validation subjects
+    val_dataset = BraTSPatchDataset(X_val_normal, y_val_normal)
+    # Testing: Mixed data (normal + anomalous) from test subjects
+    test_dataset = BraTSPatchDataset(X_test, y_test)
     
     # Step 3: Create data loaders
     print("\n3. Creating data loaders...")
     
-    # CRITICAL: For anomaly detection, we need to ensure training/validation sets
-    # contain sufficient normal data for the autoencoder to learn from
-    print(f"\nData split analysis for anomaly detection:")
-    print(f"Training will use ONLY normal data to train the autoencoder")
-    print(f"Testing will use BOTH normal and anomalous data for evaluation")
-    
-    train_dataset = BraTSPatchDataset(X_train, y_train)
-    val_dataset = BraTSPatchDataset(X_val, y_val)
-    test_dataset = BraTSPatchDataset(X_test, y_test)
+    # UPDATED EXPLANATION: For proper unsupervised anomaly detection
+    print(f"\nCORRECTED ANOMALY DETECTION APPROACH:")
+    print(f"✓ Training: ONLY normal data (autoencoder learns normal patterns)")
+    print(f"✓ Validation: ONLY normal data (monitor overfitting on normal data)")  
+    print(f"✓ Testing: MIXED data (evaluate anomaly detection performance)")
+    print(f"✓ Anomaly Detection: High reconstruction error = Anomaly")
     
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, 
                              shuffle=True, num_workers=config.num_workers)
@@ -1245,7 +1308,7 @@ def main():
     
     # Step 5: Evaluate the model
     print("\n5. Evaluating model on test set...")
-    results = detector.evaluate(test_loader)
+    results = detector.evaluate(test_loader, val_loader)
     
     # Step 6: Create visualizations
     print("\n6. Creating visualizations...")
@@ -1259,16 +1322,24 @@ def main():
     # Save results to file
     results_file = os.path.join(config.output_dir, 'evaluation_results.txt')
     with open(results_file, 'w') as f:
-        f.write("3D Autoencoder Anomaly Detection Results\n")
-        f.write("="*50 + "\n")
+        f.write("TRULY UNSUPERVISED 3D Autoencoder Anomaly Detection Results\n")
+        f.write("="*60 + "\n")
+        f.write("DATA LEAKAGE PREVENTION MEASURES:\n")
+        f.write("- Subject-level data splitting (no patient overlap)\n")
+        f.write("- Threshold determined using ONLY normal validation data\n")
+        f.write("- No test label access during threshold selection\n")
+        f.write("="*60 + "\n")
         f.write(f"ROC AUC:           {results['roc_auc']:.4f}\n")
         f.write(f"Average Precision: {results['average_precision']:.4f}\n")
-        f.write(f"Accuracy:          {results['accuracy']:.4f}\n")
+        f.write(f"Matthews Correlation: {results['mcc']:.4f}\n")
+        f.write(f"Balanced Accuracy: {results['balanced_accuracy']:.4f}\n")
+        f.write(f"F1 Score:          {results['f1_score']:.4f}\n")
         f.write(f"Precision:         {results['precision']:.4f}\n")
         f.write(f"Recall:            {results['recall']:.4f}\n")
-        f.write(f"F1 Score:          {results['f1_score']:.4f}\n")
-        f.write(f"Optimal Threshold: {results['optimal_threshold']:.6f}\n")
-        f.write("="*50 + "\n")
+        f.write(f"Specificity:       {results['specificity']:.4f}\n")
+        f.write(f"Accuracy:          {results['accuracy']:.4f}\n")
+        f.write(f"Threshold Used:    {results['optimal_threshold']:.6f}\n")
+        f.write("="*60 + "\n")
         f.write(f"Configuration:\n")
         f.write(f"  Patch size: {config.patch_size}\n")
         f.write(f"  Patches per volume: {config.patches_per_volume}\n")
@@ -1276,12 +1347,19 @@ def main():
         f.write(f"  Learning rate: {config.learning_rate}\n")
         f.write(f"  Batch size: {config.batch_size}\n")
         f.write(f"  Number of epochs: {config.num_epochs}\n")
-        f.write(f"  Training samples: {len(X_train)}\n")
+        f.write(f"  Training samples: {len(X_train_normal)}\n")
+        f.write(f"  Validation samples: {len(X_val_normal)}\n")
         f.write(f"  Test samples: {len(X_test)}\n")
+        f.write(f"  Training subjects: {len(train_subjects)}\n")
+        f.write(f"  Validation subjects: {len(val_subjects)}\n")
+        f.write(f"  Test subjects: {len(test_subjects)}\n")
     
     print(f"\nResults saved to: {results_file}")
     print("\n" + "="*60)
     print("PIPELINE COMPLETED SUCCESSFULLY!")
+    print("✓ Data leakage eliminated through subject-level splitting")
+    print("✓ Truly unsupervised threshold determination")
+    print("✓ No test label access during model development")
     print("="*60)
 
 
