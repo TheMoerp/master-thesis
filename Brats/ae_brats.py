@@ -29,6 +29,7 @@ import glob
 import argparse
 import random
 import warnings
+import time
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional, Union
 
@@ -38,6 +39,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 import pandas as pd
+import plotly.figure_factory as ff
 
 import torch
 import torch.nn as nn
@@ -85,6 +87,18 @@ class Config:
         self.max_normal_patches_per_subject = 100  # Maximum normal patches per subject
         self.max_anomaly_patches_per_subject = 50  # Maximum anomaly patches per subject
         
+        # Segmentation labels for anomaly detection
+        # BraTS segmentation labels: 0=background/normal, 1=NCR/NET, 2=ED, 4=ET
+        self.anomaly_labels = [1, 2, 4]  # Default: all tumor labels are anomalies
+        
+        # Brain tissue quality parameters for normal patches
+        self.min_brain_tissue_ratio = 0.3  # Minimum 30% of patch should be brain tissue (not background)
+        self.max_background_intensity = 0.1  # Values below this are considered background/skull
+        self.min_brain_mean_intensity = 0.1  # Minimum mean intensity for brain tissue patches
+        self.max_high_intensity_ratio = 0.7  # Maximum ratio of very bright pixels (avoid skull/CSF)
+        self.high_intensity_threshold = 0.9  # Threshold for "very bright" pixels
+        self.edge_margin = 8  # Minimum distance from volume edges to extract patches
+        
         # Model parameters
         self.latent_dim = 256  # Increased latent dimension for better representation
         self.learning_rate = 5e-5  # Reduced learning rate for more stable training
@@ -97,7 +111,6 @@ class Config:
         self.validation_split = 0.2
         
         # Visualization parameters
-        self.num_samples_visualize = 5
         self.slice_axis = 'axial'  # 'axial', 'coronal', 'sagittal'
         
         # Device configuration
@@ -296,6 +309,63 @@ class BraTSDataProcessor:
         
         return volume, segmentation
     
+    def is_brain_tissue_patch(self, patch: np.ndarray) -> bool:
+        """
+        Check if a patch contains primarily brain tissue (not background/skull/CSF)
+        """
+        # Check 1: Minimum ratio of non-background voxels
+        brain_tissue_mask = patch > self.config.max_background_intensity
+        brain_tissue_ratio = np.sum(brain_tissue_mask) / patch.size
+        
+        if brain_tissue_ratio < self.config.min_brain_tissue_ratio:
+            return False
+        
+        # Check 2: Mean intensity should be in brain tissue range
+        brain_tissue_values = patch[brain_tissue_mask]
+        if len(brain_tissue_values) == 0:
+            return False
+            
+        mean_brain_intensity = np.mean(brain_tissue_values)
+        if mean_brain_intensity < self.config.min_brain_mean_intensity:
+            return False
+        
+        # Check 3: Not too many very bright pixels (avoid skull, CSF)
+        high_intensity_mask = patch > self.config.high_intensity_threshold
+        high_intensity_ratio = np.sum(high_intensity_mask) / patch.size
+        
+        if high_intensity_ratio > self.config.max_high_intensity_ratio:
+            return False
+        
+        # Check 4: Patch should have reasonable contrast (brain has structure)
+        if patch.std() < self.config.min_patch_std * 2:  # Stricter std for brain tissue
+            return False
+        
+        # Check 5: Intensity distribution should be reasonable for brain tissue
+        # Brain tissue typically has values between 0.1 and 0.8 in normalized images
+        reasonable_intensity_mask = (patch > 0.05) & (patch < 0.95)
+        reasonable_ratio = np.sum(reasonable_intensity_mask) / patch.size
+        
+        if reasonable_ratio < 0.5:  # At least 50% should be in reasonable range
+            return False
+        
+        return True
+
+    def is_anomaly_segmentation(self, segmentation_patch: np.ndarray) -> bool:
+        """
+        Check if a segmentation patch contains any of the specified anomaly labels
+        """
+        for label in self.config.anomaly_labels:
+            if np.any(segmentation_patch == label):
+                return True
+        return False
+    
+    def get_anomaly_ratio_in_patch(self, segmentation_patch: np.ndarray) -> float:
+        """
+        Calculate the ratio of voxels with anomaly labels in the patch
+        """
+        anomaly_mask = np.isin(segmentation_patch, self.config.anomaly_labels)
+        return np.sum(anomaly_mask) / segmentation_patch.size
+
     def normalize_volume(self, volume: np.ndarray) -> np.ndarray:
         """Normalize volume to [0, 1] range while preserving tissue contrast"""
         volume = volume.astype(np.float32)
@@ -324,91 +394,136 @@ class BraTSDataProcessor:
     
     def extract_normal_patches(self, volume: np.ndarray, segmentation: np.ndarray) -> List[np.ndarray]:
         """
-        Extract normal patches from regions without tumor (label 0)
+        Extract normal patches from regions without tumor (label 0) with improved brain tissue filtering
         """
         patches = []
         
-        # Get coordinates where there's no tumor (background + healthy tissue)
-        valid_coords = np.where(segmentation == 0)
+        # Create a brain tissue mask (non-zero regions with reasonable intensity)
+        brain_mask = (volume > self.config.max_background_intensity) & (volume < 0.95)
         
-        if len(valid_coords[0]) == 0:
+        # Get coordinates where there are no specified anomaly labels AND brain tissue is present
+        # Create mask for normal tissue (not containing any of the specified anomaly labels)
+        anomaly_mask = np.isin(segmentation, self.config.anomaly_labels)
+        normal_tissue_coords = np.where(~anomaly_mask)  # Invert to get normal tissue
+        brain_coords = np.where(brain_mask)
+        
+        # Find intersection of normal tissue and brain tissue coordinates
+        normal_tissue_set = set(zip(normal_tissue_coords[0], normal_tissue_coords[1], normal_tissue_coords[2]))
+        brain_set = set(zip(brain_coords[0], brain_coords[1], brain_coords[2]))
+        valid_coords_set = normal_tissue_set.intersection(brain_set)
+        
+        if len(valid_coords_set) == 0:
+            return patches
+        
+        # Convert back to coordinate arrays
+        valid_coords_list = list(valid_coords_set)
+        
+        # Filter coordinates to avoid edges (prevent edge artifacts)
+        edge_margin = self.config.edge_margin
+        filtered_coords = []
+        for x, y, z in valid_coords_list:
+            if (x >= edge_margin and x < volume.shape[0] - edge_margin and
+                y >= edge_margin and y < volume.shape[1] - edge_margin and
+                z >= edge_margin and z < volume.shape[2] - edge_margin):
+                # Also check if we can extract a full patch at this location
+                x_start = x - self.config.patch_size // 2
+                x_end = x_start + self.config.patch_size
+                y_start = y - self.config.patch_size // 2
+                y_end = y_start + self.config.patch_size
+                z_start = z - self.config.patch_size // 2
+                z_end = z_start + self.config.patch_size
+                
+                if (x_start >= 0 and x_end <= volume.shape[0] and
+                    y_start >= 0 and y_end <= volume.shape[1] and
+                    z_start >= 0 and z_end <= volume.shape[2]):
+                    filtered_coords.append((x, y, z))
+        
+        if len(filtered_coords) == 0:
+            if self.config.verbose:
+                print("Warning: No valid coordinates found for normal patch extraction")
             return patches
         
         # Calculate number of patches to extract
-        max_patches = min(len(valid_coords[0]) // 100, self.config.max_normal_patches_per_subject)
-        
-        if max_patches == 0:
-            return patches
+        max_patches = min(len(filtered_coords) // 20, self.config.max_normal_patches_per_subject)
+        max_patches = max(max_patches, 10)  # At least try for 10 patches
         
         # Sample coordinates
-        indices = np.random.choice(len(valid_coords[0]), 
-                                 size=min(max_patches, len(valid_coords[0])), 
-                                 replace=False)
+        num_to_sample = min(max_patches * 5, len(filtered_coords))  # Sample more to filter later
+        indices = np.random.choice(len(filtered_coords), size=num_to_sample, replace=False)
         
-        patch_coords = [(valid_coords[0][i], valid_coords[1][i], valid_coords[2][i]) 
-                       for i in indices]
+        patch_coords = [filtered_coords[i] for i in indices]
         
-        # Extract patches with progress bar
+        patches_extracted = 0
+        patches_rejected = 0
+        
+        # Extract patches with enhanced quality control
         for x, y, z in tqdm(patch_coords, desc="Extracting normal patches", leave=False):
-            # Calculate patch boundaries
-            x_start = max(0, x - self.config.patch_size // 2)
-            x_end = min(volume.shape[0], x_start + self.config.patch_size)
-            y_start = max(0, y - self.config.patch_size // 2)
-            y_end = min(volume.shape[1], y_start + self.config.patch_size)
-            z_start = max(0, z - self.config.patch_size // 2)
-            z_end = min(volume.shape[2], z_start + self.config.patch_size)
-            
-            # Adjust start coordinates if patch would be too small
-            if x_end - x_start < self.config.patch_size:
-                x_start = max(0, x_end - self.config.patch_size)
-            if y_end - y_start < self.config.patch_size:
-                y_start = max(0, y_end - self.config.patch_size)
-            if z_end - z_start < self.config.patch_size:
-                z_start = max(0, z_end - self.config.patch_size)
-            
-            # Skip if we can't get a full-sized patch
-            if (x_end - x_start != self.config.patch_size or 
-                y_end - y_start != self.config.patch_size or 
-                z_end - z_start != self.config.patch_size):
-                continue
+            # Calculate patch boundaries (we already checked they're valid)
+            x_start = x - self.config.patch_size // 2
+            x_end = x_start + self.config.patch_size
+            y_start = y - self.config.patch_size // 2
+            y_end = y_start + self.config.patch_size
+            z_start = z - self.config.patch_size // 2
+            z_end = z_start + self.config.patch_size
             
             patch = volume[x_start:x_end, y_start:y_end, z_start:z_end]
+            patch_seg = segmentation[x_start:x_end, y_start:y_end, z_start:z_end]
             
-            # Quality checks
-            if patch.std() > self.config.min_patch_std and patch.mean() > self.config.min_patch_mean:
-                # Verify this is actually a normal patch
-                patch_seg = segmentation[x_start:x_end, y_start:y_end, z_start:z_end]
-                tumor_ratio = np.sum(patch_seg > 0) / patch_seg.size
-                
-                if tumor_ratio <= self.config.max_tumor_ratio_normal:
-                    patches.append(patch)
+            # Enhanced quality checks for brain tissue
+            anomaly_ratio = self.get_anomaly_ratio_in_patch(patch_seg)
+            
+            # Check 1: No anomaly labels (according to specified anomaly_labels)
+            if anomaly_ratio > self.config.max_tumor_ratio_normal:
+                patches_rejected += 1
+                continue
+            
+            # Check 2: Brain tissue quality check
+            if not self.is_brain_tissue_patch(patch):
+                patches_rejected += 1
+                continue
+            
+            # Check 3: Additional contrast and structure checks
+            if patch.std() < self.config.min_patch_std:
+                patches_rejected += 1
+                continue
+            
+            # If all checks pass, add the patch
+            patches.append(patch)
+            patches_extracted += 1
+            
+            # Stop if we have enough patches
+            if patches_extracted >= max_patches:
+                break
         
+        if self.config.verbose:
+            print(f"Normal patch extraction: {patches_extracted} accepted, {patches_rejected} rejected")
         return patches
     
     def extract_anomalous_patches(self, volume: np.ndarray, segmentation: np.ndarray) -> List[np.ndarray]:
         """
-        Extract anomalous patches from tumor regions (labels 1, 2, 4)
+        Extract anomalous patches from regions with specified anomaly labels
         """
         patches = []
         
-        # Get coordinates where there's tumor
-        tumor_coords = np.where(segmentation > 0)
+        # Get coordinates where there are specified anomaly labels
+        anomaly_mask = np.isin(segmentation, self.config.anomaly_labels)
+        anomaly_coords = np.where(anomaly_mask)
         
-        if len(tumor_coords[0]) == 0:
+        if len(anomaly_coords[0]) == 0:
             return patches
         
         # Calculate number of patches to extract
-        max_patches = min(len(tumor_coords[0]) // 50, self.config.max_anomaly_patches_per_subject)
+        max_patches = min(len(anomaly_coords[0]) // 50, self.config.max_anomaly_patches_per_subject)
         
         if max_patches == 0:
             return patches
         
         # Sample coordinates
-        indices = np.random.choice(len(tumor_coords[0]), 
-                                 size=min(max_patches, len(tumor_coords[0])), 
+        indices = np.random.choice(len(anomaly_coords[0]), 
+                                 size=min(max_patches, len(anomaly_coords[0])), 
                                  replace=False)
         
-        patch_coords = [(tumor_coords[0][i], tumor_coords[1][i], tumor_coords[2][i]) 
+        patch_coords = [(anomaly_coords[0][i], anomaly_coords[1][i], anomaly_coords[2][i]) 
                        for i in indices]
         
         # Extract patches with progress bar
@@ -439,11 +554,11 @@ class BraTSDataProcessor:
             
             # Quality checks
             if patch.std() > self.config.min_patch_std and patch.mean() > self.config.min_patch_mean:
-                # Verify this patch contains tumor
+                # Verify this patch contains specified anomaly labels
                 patch_seg = segmentation[x_start:x_end, y_start:y_end, z_start:z_end]
-                tumor_ratio = np.sum(patch_seg > 0) / patch_seg.size
+                anomaly_ratio = self.get_anomaly_ratio_in_patch(patch_seg)
                 
-                if tumor_ratio >= self.config.min_tumor_ratio_anomaly:
+                if anomaly_ratio >= self.config.min_tumor_ratio_anomaly:
                     patches.append(patch)
         
         return patches
@@ -458,7 +573,8 @@ class BraTSDataProcessor:
         if num_subjects:
             subject_dirs = subject_dirs[:num_subjects]
         
-        print(f"Processing {len(subject_dirs)} subjects...")
+        if self.config.verbose:
+            print(f"Processing {len(subject_dirs)} subjects...")
         
         all_normal_patches = []
         all_anomalous_patches = []
@@ -492,7 +608,8 @@ class BraTSDataProcessor:
             except Exception as e:
                 continue
         
-        print(f"Extracted {len(all_normal_patches)} normal patches and {len(all_anomalous_patches)} anomalous patches")
+        if self.config.verbose:
+            print(f"Extracted {len(all_normal_patches)} normal patches and {len(all_anomalous_patches)} anomalous patches")
         
         # Balance dataset
         num_anomalous = len(all_anomalous_patches)
@@ -503,7 +620,8 @@ class BraTSDataProcessor:
             all_normal_patches = [all_normal_patches[i] for i in indices]
             all_normal_subjects = [all_normal_subjects[i] for i in indices]
         
-        print(f"Final dataset: {len(all_normal_patches)} normal, {len(all_anomalous_patches)} anomalous patches")
+        if self.config.verbose:
+            print(f"Final dataset: {len(all_normal_patches)} normal, {len(all_anomalous_patches)} anomalous patches")
         
         # Combine patches and create labels
         all_patches = all_normal_patches + all_anomalous_patches
@@ -519,7 +637,8 @@ class BraTSDataProcessor:
     def validate_patch_quality(self, patches: np.ndarray, labels: np.ndarray, 
                               sample_segmentations: List[np.ndarray] = None) -> Dict:
         """Validate the quality of extracted patches"""
-        print("\nValidating patch quality...")
+        if self.config.verbose:
+            print("\nValidating patch quality...")
         
         normal_patches = patches[labels == 0]
         anomaly_patches = patches[labels == 1]
@@ -540,24 +659,25 @@ class BraTSDataProcessor:
             }
         }
         
-        print(f"Normal patches statistics:")
-        print(f"  Count: {stats['normal_patches']['count']}")
-        print(f"  Mean intensity: {stats['normal_patches']['mean_intensity']:.4f}")
-        print(f"  Non-zero ratio: {stats['normal_patches']['non_zero_ratio']:.4f}")
-        
-        print(f"Anomaly patches statistics:")
-        print(f"  Count: {stats['anomaly_patches']['count']}")
-        print(f"  Mean intensity: {stats['anomaly_patches']['mean_intensity']:.4f}")
-        print(f"  Non-zero ratio: {stats['anomaly_patches']['non_zero_ratio']:.4f}")
-        
-        # Check for potential issues
-        if stats['anomaly_patches']['mean_intensity'] <= stats['normal_patches']['mean_intensity']:
-            print("WARNING: Anomaly patches have lower or equal intensity than normal patches!")
-            print("This might indicate poor patch extraction or data preprocessing issues.")
-        
-        if abs(stats['normal_patches']['non_zero_ratio'] - stats['anomaly_patches']['non_zero_ratio']) < 0.1:
-            print("WARNING: Normal and anomaly patches have very similar non-zero ratios!")
-            print("This might indicate insufficient differentiation in patch extraction.")
+        if self.config.verbose:
+            print(f"Normal patches statistics:")
+            print(f"  Count: {stats['normal_patches']['count']}")
+            print(f"  Mean intensity: {stats['normal_patches']['mean_intensity']:.4f}")
+            print(f"  Non-zero ratio: {stats['normal_patches']['non_zero_ratio']:.4f}")
+            
+            print(f"Anomaly patches statistics:")
+            print(f"  Count: {stats['anomaly_patches']['count']}")
+            print(f"  Mean intensity: {stats['anomaly_patches']['mean_intensity']:.4f}")
+            print(f"  Non-zero ratio: {stats['anomaly_patches']['non_zero_ratio']:.4f}")
+            
+            # Check for potential issues
+            if stats['anomaly_patches']['mean_intensity'] <= stats['normal_patches']['mean_intensity']:
+                print("WARNING: Anomaly patches have lower or equal intensity than normal patches!")
+                print("This might indicate poor patch extraction or data preprocessing issues.")
+            
+            if abs(stats['normal_patches']['non_zero_ratio'] - stats['anomaly_patches']['non_zero_ratio']) < 0.1:
+                print("WARNING: Normal and anomaly patches have very similar non-zero ratios!")
+                print("This might indicate insufficient differentiation in patch extraction.")
         
         return stats
 
@@ -584,8 +704,9 @@ class AnomalyDetector:
         
         total_steps = self.config.num_epochs * len(train_loader)
         
-        print("TRAINING MODE: Autoencoder will be trained ONLY on normal data (unsupervised)")
-        print("Anomalous data will be used ONLY for testing, not training")
+        if self.config.verbose:
+            print("TRAINING MODE: Autoencoder will be trained ONLY on normal data (unsupervised)")
+            print("Anomalous data will be used ONLY for testing, not training")
         
         with tqdm(total=total_steps, desc="Training Progress") as pbar:
             for epoch in range(self.config.num_epochs):
@@ -660,7 +781,7 @@ class AnomalyDetector:
                 scheduler.step(avg_val_loss)
                 
                 # Print epoch summary
-                if (epoch + 1) % 10 == 0:
+                if (epoch + 1) % 10 == 0 and self.config.verbose:
                     print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
                     print(f"Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
                     print(f"Normal samples processed: Train={normal_samples_processed}, Val={val_normal_samples}")
@@ -678,8 +799,9 @@ class AnomalyDetector:
                     pbar.write(f"Early stopping triggered after {epoch+1} epochs")
                     break
         
-        print(f"\nTraining completed. Model trained on normal data only.")
-        print(f"Best validation loss: {best_val_loss:.6f}")
+        if self.config.verbose:
+            print(f"\nTraining completed. Model trained on normal data only.")
+            print(f"Best validation loss: {best_val_loss:.6f}")
         
         # Save training history
         self.save_training_plots(train_losses, val_losses)
@@ -725,9 +847,10 @@ class AnomalyDetector:
     
     def find_unsupervised_threshold(self, val_loader: DataLoader) -> float:
         """Find threshold using ONLY normal validation data (no test label access)"""
-        print(f"\nUNSUPERVISED THRESHOLD DETERMINATION (No Test Label Access)")
-        print(f"{'='*60}")
-        print("Computing threshold using ONLY normal validation data...")
+        if self.config.verbose:
+            print(f"\nUNSUPERVISED THRESHOLD DETERMINATION (No Test Label Access)")
+            print(f"{'='*60}")
+            print("Computing threshold using ONLY normal validation data...")
         
         # Calculate reconstruction errors on validation set (only normal data)
         self.model.eval()
@@ -754,9 +877,10 @@ class AnomalyDetector:
         
         normal_val_errors = np.array(normal_val_errors)
         
-        print(f"Normal validation errors - Count: {len(normal_val_errors)}")
-        print(f"Normal validation errors - Mean: {normal_val_errors.mean():.6f}, Std: {normal_val_errors.std():.6f}")
-        print(f"Normal validation errors - Min: {normal_val_errors.min():.6f}, Max: {normal_val_errors.max():.6f}")
+        if self.config.verbose:
+            print(f"Normal validation errors - Count: {len(normal_val_errors)}")
+            print(f"Normal validation errors - Mean: {normal_val_errors.mean():.6f}, Std: {normal_val_errors.std():.6f}")
+            print(f"Normal validation errors - Min: {normal_val_errors.min():.6f}, Max: {normal_val_errors.max():.6f}")
         
         # Create unsupervised threshold candidates based ONLY on normal data
         threshold_methods = {
@@ -769,20 +893,22 @@ class AnomalyDetector:
             'iqr_outlier': np.percentile(normal_val_errors, 75) + 1.5 * (np.percentile(normal_val_errors, 75) - np.percentile(normal_val_errors, 25))
         }
         
-        print(f"\nUNSUPERVISED THRESHOLD CANDIDATES:")
-        print(f"{'Method':<20} {'Threshold':<12}")
-        print(f"{'-'*35}")
-        for method, threshold in threshold_methods.items():
-            print(f"{method:<20} {threshold:<12.6f}")
+        if self.config.verbose:
+            print(f"\nUNSUPERVISED THRESHOLD CANDIDATES:")
+            print(f"{'Method':<20} {'Threshold':<12}")
+            print(f"{'-'*35}")
+            for method, threshold in threshold_methods.items():
+                print(f"{method:<20} {threshold:<12.6f}")
         
         # Use 95th percentile as default (common practice in anomaly detection)
         selected_threshold = threshold_methods['percentile_95']
         selected_method = 'percentile_95'
         
-        print(f"\nSELECTED THRESHOLD: {selected_threshold:.6f} (Method: {selected_method})")
-        print(f"Rationale: 95th percentile of normal validation errors is a conservative,")
-        print(f"commonly used threshold that doesn't require test label access.")
-        print(f"{'='*60}")
+        if self.config.verbose:
+            print(f"\nSELECTED THRESHOLD: {selected_threshold:.6f} (Method: {selected_method})")
+            print(f"Rationale: 95th percentile of normal validation errors is a conservative,")
+            print(f"commonly used threshold that doesn't require test label access.")
+            print(f"{'='*60}")
         
         return selected_threshold
     
@@ -792,7 +918,8 @@ class AnomalyDetector:
         model_path = os.path.join(self.config.output_dir, 'best_autoencoder_3d.pth')
         if os.path.exists(model_path):
             self.model.load_state_dict(torch.load(model_path))
-            print("Loaded best model for evaluation")
+            if self.config.verbose:
+                print("Loaded best model for evaluation")
         
         # STEP 1: Determine threshold using ONLY normal validation data (no test label access)
         optimal_threshold = self.find_unsupervised_threshold(val_loader)
@@ -831,6 +958,9 @@ class AnomalyDetector:
         # Matthews Correlation Coefficient
         mcc = ((tp * tn) - (fp * fn)) / np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) if ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) > 0 else 0
         
+        # Dice Similarity Coefficient (DSC)
+        dsc = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+        
         # False Positive Rate and False Negative Rate
         fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
         fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
@@ -845,6 +975,7 @@ class AnomalyDetector:
         print(f"ROC AUC:                  {roc_auc:.4f}")
         print(f"Average Precision (AP):   {average_precision:.4f}")
         print(f"Matthews Correlation:     {mcc:.4f}")
+        print(f"Dice Similarity Coeff:    {dsc:.4f}")
         print(f"Balanced Accuracy:        {balanced_accuracy:.4f}")
         print(f"F1 Score:                 {f1:.4f}")
         print(f"Precision:                {precision:.4f}")
@@ -878,6 +1009,7 @@ class AnomalyDetector:
             'roc_auc': roc_auc,
             'average_precision': average_precision,
             'mcc': mcc,
+            'dsc': dsc,
             'balanced_accuracy': balanced_accuracy,
             'accuracy': accuracy,
             'precision': precision,
@@ -900,81 +1032,86 @@ class Visualizer:
         self.config = config
         
     def plot_confusion_matrix(self, true_labels: np.ndarray, predictions: np.ndarray):
-        """Plot confusion matrix with improved formatting"""
+        """Plot confusion matrix with improved formatting using Plotly"""
         cm = confusion_matrix(true_labels, predictions)
         
-        # Print detailed information
-        print(f"\nConfusion Matrix Details:")
-        print(f"True Labels - Normal: {np.sum(true_labels == 0)}, Anomaly: {np.sum(true_labels == 1)}")
-        print(f"Predictions - Normal: {np.sum(predictions == 0)}, Anomaly: {np.sum(predictions == 1)}")
-        print(f"Confusion Matrix:\n{cm}")
-        
-        # Check if we have both classes in predictions and true labels
-        if len(np.unique(true_labels)) < 2:
-            print("WARNING: True labels contain only one class!")
-        if len(np.unique(predictions)) < 2:
-            print("WARNING: Predictions contain only one class!")
-        
-        plt.figure(figsize=(12, 10))
-        
-        # Create percentage annotations for better readability
-        cm_percent = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis] * 100
-        
-        # Create combined annotations showing both count and percentage
-        annotations = []
-        for i in range(cm.shape[0]):
-            row = []
-            for j in range(cm.shape[1]):
-                text = f'{cm[i, j]}\n({cm_percent[i, j]:.1f}%)'
-                row.append(text)
-            annotations.append(row)
-        
-        # Plot heatmap with improved formatting
-        ax = sns.heatmap(cm, 
-                        annot=np.array(annotations), 
-                        fmt='', 
-                        cmap='Blues',
-                        xticklabels=['Normal (0)', 'Anomaly (1)'],
-                        yticklabels=['Normal (0)', 'Anomaly (1)'],
-                        cbar_kws={'label': 'Count'},
-                        square=True,
-                        linewidths=2,
-                        linecolor='white',
-                        annot_kws={'size': 14, 'weight': 'bold'})
-        
-        # Improve title and labels
-        plt.title('Confusion Matrix\n(Count and Percentage)', fontsize=16, fontweight='bold', pad=20)
-        plt.xlabel('Predicted Label', fontsize=14, fontweight='bold')
-        plt.ylabel('True Label', fontsize=14, fontweight='bold')
-        
-        # Adjust tick labels
-        ax.tick_params(axis='both', which='major', labelsize=12)
-        
-        # Add summary statistics as text
-        total_samples = cm.sum()
-        accuracy = np.trace(cm) / total_samples
-        
-        # Calculate per-class metrics
+        if self.config.verbose:
+            print(f"\nConfusion Matrix Details:")
+            print(f"True Labels - Normal: {np.sum(true_labels == 0)}, Anomaly: {np.sum(true_labels == 1)}")
+            print(f"Predictions - Normal: {np.sum(predictions == 0)}, Anomaly: {np.sum(predictions == 1)}")
+            print(f"Confusion Matrix:\n{cm}")
+
+        if cm.shape != (2, 2):
+            if self.config.verbose:
+                print("WARNING: Confusion matrix is not 2x2. Skipping plot generation.")
+            return
+
         tn, fp, fn, tp = cm.ravel()
+        
+        z = [[tn, fp], [fn, tp]]
+        x = ['Normal (0)', 'Anomaly (1)']
+        y = ['Normal (0)', 'Anomaly (1)']
+
+        row_sums = cm.sum(axis=1)
+        
+        # Avoid division by zero if a class has no samples
+        z_text = [
+            [f"{tn}<br>({tn/row_sums[0]*100:.1f}%)" if row_sums[0] > 0 else str(tn),
+             f"{fp}<br>({fp/row_sums[0]*100:.1f}%)" if row_sums[0] > 0 else str(fp)],
+            [f"{fn}<br>({fn/row_sums[1]*100:.1f}%)" if row_sums[1] > 0 else str(fn),
+             f"{tp}<br>({tp/row_sums[1]*100:.1f}%)" if row_sums[1] > 0 else str(tp)]
+        ]
+
+        fig = ff.create_annotated_heatmap(
+            z, x=x, y=y, annotation_text=z_text, colorscale='Blues',
+            font_colors=['black', 'white']
+        )
+
+        fig.update_layout(
+            title_text='<b>Confusion Matrix</b><br>(Count and Percentage)',
+            title_x=0.5,
+            xaxis=dict(title='<b>Predicted Label</b>'),
+            yaxis=dict(title='<b>True Label</b>', autorange='reversed'),
+            font=dict(size=14)
+        )
+        fig.update_xaxes(side="bottom")
+
+        total_samples = cm.sum()
+        accuracy = (tp + tn) / total_samples if total_samples > 0 else 0
         precision = tp / (tp + fp) if (tp + fp) > 0 else 0
         recall = tp / (tp + fn) if (tp + fn) > 0 else 0
         specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
         
-        summary_text = (f'Total Samples: {total_samples}\n'
-                       f'Accuracy: {accuracy:.3f}\n'
-                       f'Precision: {precision:.3f}\n'
-                       f'Recall: {recall:.3f}\n'
+        summary_text = (f'Total Samples: {total_samples}<br>'
+                       f'Accuracy: {accuracy:.3f}<br>'
+                       f'Precision: {precision:.3f}<br>'
+                       f'Recall: {recall:.3f}<br>'
                        f'Specificity: {specificity:.3f}')
         
-        plt.figtext(0.02, 0.02, summary_text, 
-                   fontsize=11, 
-                   bbox=dict(boxstyle="round,pad=0.5", facecolor="lightgray", alpha=0.8))
+        fig.add_annotation(
+            text=summary_text,
+            align='left',
+            showarrow=False,
+            xref='paper',
+            yref='paper',
+            x=0.0,
+            y=-0.28,
+            bordercolor="black",
+            borderwidth=1,
+            bgcolor="lightgray",
+            font_size=12
+        )
         
-        plt.tight_layout()
-        plt.subplots_adjust(bottom=0.15)  # Make room for summary text
-        plt.savefig(os.path.join(self.config.output_dir, 'confusion_matrix.png'), 
-                   dpi=300, bbox_inches='tight', facecolor='white')
-        plt.close()
+        fig.update_layout(margin=dict(t=100, b=150))
+
+        output_path = os.path.join(self.config.output_dir, 'confusion_matrix.png')
+        try:
+            fig.write_image(output_path, width=800, height=800, scale=2)
+            if self.config.verbose:
+                print(f"Confusion Matrix plot saved to {output_path}")
+        except ValueError as e: 
+            print(f"ERROR: Could not save confusion matrix plot: {e}")
+            print("Please make sure you have 'plotly' and 'kaleido' installed (`pip install plotly kaleido`).")
     
     def plot_roc_curve(self, true_labels: np.ndarray, reconstruction_errors: np.ndarray):
         """Plot ROC curve"""
@@ -1083,40 +1220,95 @@ class Visualizer:
                    dpi=300, bbox_inches='tight')
         plt.close()
     
-    def visualize_3d_patches(self, patches: np.ndarray, labels: np.ndarray, num_samples: int = 5):
-        """Visualize 3D patches by showing multiple slices"""
-        print(f"Visualizing {num_samples} sample patches...")
+    def visualize_3d_patches(self, patches: np.ndarray, labels: np.ndarray, 
+                           num_normal: int = 100, num_anomaly: int = 10):
+        """Visualize 3D patches by showing multiple slices in separate folder"""
+        # Create patches visualization subdirectory
+        patches_dir = os.path.join(self.config.output_dir, 'patches_visualization')
+        os.makedirs(patches_dir, exist_ok=True)
         
-        # Select random samples
-        indices = np.random.choice(len(patches), min(num_samples, len(patches)), replace=False)
+        # Create subdirectories for normal and anomaly patches
+        normal_dir = os.path.join(patches_dir, 'normal_patches')
+        anomaly_dir = os.path.join(patches_dir, 'anomaly_patches')
+        os.makedirs(normal_dir, exist_ok=True)
+        os.makedirs(anomaly_dir, exist_ok=True)
         
-        for i, idx in enumerate(indices):
-            patch = patches[idx]
-            label = labels[idx]
-            label_name = "Anomaly" if label == 1 else "Normal"
+        if self.config.verbose:
+            print(f"Visualizing patches in separate folder: {patches_dir}")
+            print(f"Saving {num_normal} normal patches and {num_anomaly} anomaly patches...")
+        
+        # Separate patches by label
+        normal_indices = np.where(labels == 0)[0]
+        anomaly_indices = np.where(labels == 1)[0]
+        
+        # Sample normal patches
+        if len(normal_indices) > 0:
+            selected_normal = np.random.choice(normal_indices, 
+                                             size=min(num_normal, len(normal_indices)), 
+                                             replace=False)
             
-            # Create subplot for different slice orientations
-            fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-            fig.suptitle(f'Sample {i+1}: {label_name} Patch', fontsize=16)
+            for i, idx in enumerate(tqdm(selected_normal, desc="Saving normal patches")):
+                patch = patches[idx]
+                
+                # Create subplot for different slice orientations
+                fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+                fig.suptitle(f'Normal Patch #{i+1}', fontsize=16, fontweight='bold')
+                
+                # Show axial slices (z-axis)
+                for j in range(4):
+                    slice_idx = int(patch.shape[2] * (j + 1) / 5)  # Evenly spaced slices
+                    axes[0, j].imshow(patch[:, :, slice_idx], cmap='gray')
+                    axes[0, j].set_title(f'Axial Slice {slice_idx}')
+                    axes[0, j].axis('off')
+                
+                # Show coronal slices (y-axis)
+                for j in range(4):
+                    slice_idx = int(patch.shape[1] * (j + 1) / 5)  # Evenly spaced slices
+                    axes[1, j].imshow(patch[:, slice_idx, :], cmap='gray')
+                    axes[1, j].set_title(f'Coronal Slice {slice_idx}')
+                    axes[1, j].axis('off')
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(normal_dir, f'normal_patch_{i+1:03d}.png'), 
+                           dpi=300, bbox_inches='tight')
+                plt.close()
+        
+        # Sample anomaly patches
+        if len(anomaly_indices) > 0:
+            selected_anomaly = np.random.choice(anomaly_indices, 
+                                              size=min(num_anomaly, len(anomaly_indices)), 
+                                              replace=False)
             
-            # Show axial slices (z-axis)
-            for j in range(4):
-                slice_idx = int(patch.shape[2] * (j + 1) / 5)  # Evenly spaced slices
-                axes[0, j].imshow(patch[:, :, slice_idx], cmap='gray')
-                axes[0, j].set_title(f'Axial Slice {slice_idx}')
-                axes[0, j].axis('off')
-            
-            # Show coronal slices (y-axis)
-            for j in range(4):
-                slice_idx = int(patch.shape[1] * (j + 1) / 5)  # Evenly spaced slices
-                axes[1, j].imshow(patch[:, slice_idx, :], cmap='gray')
-                axes[1, j].set_title(f'Coronal Slice {slice_idx}')
-                axes[1, j].axis('off')
-            
-            plt.tight_layout()
-            plt.savefig(os.path.join(self.config.output_dir, f'patch_visualization_sample_{i}.png'), 
-                       dpi=300, bbox_inches='tight')
-            plt.close()
+            for i, idx in enumerate(tqdm(selected_anomaly, desc="Saving anomaly patches")):
+                patch = patches[idx]
+                
+                # Create subplot for different slice orientations
+                fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+                fig.suptitle(f'Anomaly Patch #{i+1}', fontsize=16, fontweight='bold', color='red')
+                
+                # Show axial slices (z-axis)
+                for j in range(4):
+                    slice_idx = int(patch.shape[2] * (j + 1) / 5)  # Evenly spaced slices
+                    axes[0, j].imshow(patch[:, :, slice_idx], cmap='gray')
+                    axes[0, j].set_title(f'Axial Slice {slice_idx}')
+                    axes[0, j].axis('off')
+                
+                # Show coronal slices (y-axis)
+                for j in range(4):
+                    slice_idx = int(patch.shape[1] * (j + 1) / 5)  # Evenly spaced slices
+                    axes[1, j].imshow(patch[:, slice_idx, :], cmap='gray')
+                    axes[1, j].set_title(f'Coronal Slice {slice_idx}')
+                    axes[1, j].axis('off')
+                
+                plt.tight_layout()
+                plt.savefig(os.path.join(anomaly_dir, f'anomaly_patch_{i+1:03d}.png'), 
+                           dpi=300, bbox_inches='tight')
+                plt.close()
+        
+        if self.config.verbose:
+            print(f"✓ Normal patches saved to: {normal_dir}")
+            print(f"✓ Anomaly patches saved to: {anomaly_dir}")
+            print(f"✓ Total patches visualized: {min(num_normal, len(normal_indices))} normal + {min(num_anomaly, len(anomaly_indices))} anomaly")
     
     def create_summary_report(self, results: Dict):
         """Create a summary report with all visualizations"""
@@ -1133,6 +1325,9 @@ class Visualizer:
 
 def main():
     """Main function to run the complete pipeline"""
+    # Start timing the entire process
+    start_time = time.time()
+    
     parser = argparse.ArgumentParser(description='3D Autoencoder Anomaly Detection for BraTS Dataset')
     parser.add_argument('--num_subjects', type=int, default=None, 
                        help='Number of subjects to use (default: all)')
@@ -1156,6 +1351,14 @@ def main():
                        help='Maximum ratio of normal to anomaly patches (default: 3)')
     parser.add_argument('--min_tumor_ratio_in_patch', type=float, default=0.05,
                        help='Minimum tumor ratio in anomalous patches (default: 0.05)')
+    parser.add_argument('--anomaly_labels', type=int, nargs='+', default=[1, 2, 4],
+                       help='BraTS segmentation labels to consider as anomalies (default: [1, 2, 4]). '
+                            'Available labels: 0=background/normal tissue, 1=NCR/NET (necrotic and non-enhancing tumor core), '
+                            '2=ED (peritumoral edematous/invaded tissue), 4=ET (GD-enhancing tumor). '
+                            'Examples: --anomaly_labels 1 4 (only solid tumor), --anomaly_labels 2 (only edema), '
+                            '--anomaly_labels 1 2 4 (all tumor types - default)')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                       help='Enable verbose output with detailed debug information (default: minimal output)')
     
     args = parser.parse_args()
     
@@ -1174,23 +1377,39 @@ def main():
     config.dataset_path = args.dataset_path
     config.max_normal_to_anomaly_ratio = args.max_normal_to_anomaly_ratio
     config.min_tumor_ratio_in_patch = args.min_tumor_ratio_in_patch
+    config.anomaly_labels = args.anomaly_labels
+    config.verbose = args.verbose
     
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
     
-    print("="*60)
-    print("3D AUTOENCODER ANOMALY DETECTION FOR BRATS DATASET")
-    print("="*60)
-    print(f"Device: {config.device}")
-    print(f"Dataset path: {config.dataset_path}")
-    print(f"Output directory: {config.output_dir}")
-    print(f"Patch size: {config.patch_size}x{config.patch_size}x{config.patch_size}")
-    print(f"Patches per volume: {config.patches_per_volume}")
-    print(f"Number of subjects: {config.num_subjects if config.num_subjects else 'All'}")
-    print("="*60)
+    if config.verbose:
+        print("="*60)
+        print("3D AUTOENCODER ANOMALY DETECTION FOR BRATS DATASET")
+        print("="*60)
+        print(f"Device: {config.device}")
+        print(f"Dataset path: {config.dataset_path}")
+        print(f"Output directory: {config.output_dir}")
+        print(f"Patch size: {config.patch_size}x{config.patch_size}x{config.patch_size}")
+        print(f"Patches per volume: {config.patches_per_volume}")
+        print(f"Number of subjects: {config.num_subjects if config.num_subjects else 'All'}")
+        
+        # Explain anomaly labels
+        label_names = {0: "Background/Normal", 1: "NCR/NET (Necrotic/Non-enhancing)", 
+                       2: "ED (Edema)", 4: "ET (Enhancing Tumor)"}
+        anomaly_names = [f"{label} ({label_names.get(label, 'Unknown')})" for label in config.anomaly_labels]
+        print(f"Anomaly labels: {anomaly_names}")
+        print("="*60)
+    else:
+        # Minimal output - just essential info
+        label_names = {0: "Background/Normal", 1: "NCR/NET (Necrotic/Non-enhancing)", 
+                       2: "ED (Edema)", 4: "ET (Enhancing Tumor)"}
+        anomaly_names = [f"{label}" for label in config.anomaly_labels]
+        print(f"3D Autoencoder Anomaly Detection | Anomaly labels: {anomaly_names} | Output: {config.output_dir}")
     
     # Step 1: Process dataset and extract patches
-    print("\n1. Processing dataset and extracting patches...")
+    if config.verbose:
+        print("\n1. Processing dataset and extracting patches...")
     processor = BraTSDataProcessor(config)
     patches, labels, subjects = processor.process_dataset(config.num_subjects)
     
@@ -1198,20 +1417,23 @@ def main():
         print("Error: No patches extracted! Please check your dataset path and structure.")
         return
     
-    print(f"Total patches extracted: {len(patches)}")
-    print(f"Patch shape: {patches[0].shape}")
-    print(f"Normal patches: {np.sum(labels == 0)}")
-    print(f"Anomalous patches: {np.sum(labels == 1)}")
-    
-    # Step 1.5: Validate patch quality
-    processor.validate_patch_quality(patches, labels)
+    if config.verbose:
+        print(f"Total patches extracted: {len(patches)}")
+        print(f"Patch shape: {patches[0].shape}")
+        print(f"Normal patches: {np.sum(labels == 0)}")
+        print(f"Anomalous patches: {np.sum(labels == 1)}")
+        
+        # Step 1.5: Validate patch quality
+        processor.validate_patch_quality(patches, labels)
     
     # Step 2: Split data into train and test sets
-    print("\n2. Subject-level data splitting for truly unsupervised anomaly detection...")
+    if config.verbose:
+        print("\n2. Subject-level data splitting for truly unsupervised anomaly detection...")
     
     # Check if we have both classes
     unique_labels, counts = np.unique(labels, return_counts=True)
-    print(f"Label distribution: {dict(zip(unique_labels, counts))}")
+    if config.verbose:
+        print(f"Label distribution: {dict(zip(unique_labels, counts))}")
     
     if len(unique_labels) < 2:
         print("ERROR: Dataset contains only one class! Cannot perform anomaly detection.")
@@ -1220,7 +1442,8 @@ def main():
     
     # CRITICAL FIX: Subject-level splitting to prevent patient data leakage
     unique_subjects = list(set(subjects))
-    print(f"Total unique subjects: {len(unique_subjects)}")
+    if config.verbose:
+        print(f"Total unique subjects: {len(unique_subjects)}")
     
     # Split subjects (not patches) into train/val/test
     np.random.shuffle(unique_subjects)
@@ -1229,10 +1452,11 @@ def main():
     val_subjects = unique_subjects[int(0.6 * n_subjects):int(0.8 * n_subjects)]  # 20% for validation
     test_subjects = unique_subjects[int(0.8 * n_subjects):]  # 20% for testing
     
-    print(f"Subject distribution:")
-    print(f"  Training subjects: {len(train_subjects)}")
-    print(f"  Validation subjects: {len(val_subjects)}")
-    print(f"  Test subjects: {len(test_subjects)}")
+    if config.verbose:
+        print(f"Subject distribution:")
+        print(f"  Training subjects: {len(train_subjects)}")
+        print(f"  Validation subjects: {len(val_subjects)}")
+        print(f"  Test subjects: {len(test_subjects)}")
     
     # Create patch-level splits based on subject assignment
     train_indices = [i for i, subj in enumerate(subjects) if subj in train_subjects]
@@ -1261,20 +1485,22 @@ def main():
     # Test set keeps both normal and anomalous (for evaluation)
     # This is the only place where we're allowed to have anomalous data
     
-    print(f"\n=== SUBJECT-LEVEL UNSUPERVISED ANOMALY DETECTION SPLIT ===")
-    print(f"Training set (NORMAL ONLY): {len(X_train_normal)} patches from {len(train_subjects)} subjects")
-    print(f"  Normal: {np.sum(y_train_normal == 0)}, Anomalous: {np.sum(y_train_normal == 1)}")
-    print(f"Validation set (NORMAL ONLY): {len(X_val_normal)} patches from {len(val_subjects)} subjects") 
-    print(f"  Normal: {np.sum(y_val_normal == 0)}, Anomalous: {np.sum(y_val_normal == 1)}")
-    print(f"Test set (MIXED): {len(X_test)} patches from {len(test_subjects)} subjects")
-    print(f"  Normal: {np.sum(y_test == 0)}, Anomalous: {np.sum(y_test == 1)}")
-    print(f"========================================================")
+    if config.verbose:
+        print(f"\n=== SUBJECT-LEVEL UNSUPERVISED ANOMALY DETECTION SPLIT ===")
+        print(f"Training set (NORMAL ONLY): {len(X_train_normal)} patches from {len(train_subjects)} subjects")
+        print(f"  Normal: {np.sum(y_train_normal == 0)}, Anomalous: {np.sum(y_train_normal == 1)}")
+        print(f"Validation set (NORMAL ONLY): {len(X_val_normal)} patches from {len(val_subjects)} subjects") 
+        print(f"  Normal: {np.sum(y_val_normal == 0)}, Anomalous: {np.sum(y_val_normal == 1)}")
+        print(f"Test set (MIXED): {len(X_test)} patches from {len(test_subjects)} subjects")
+        print(f"  Normal: {np.sum(y_test == 0)}, Anomalous: {np.sum(y_test == 1)}")
+        print(f"========================================================")
     
     # Verify no subject appears in multiple splits
     assert len(set(train_subjects) & set(val_subjects)) == 0, "Subject overlap between train and validation!"
     assert len(set(train_subjects) & set(test_subjects)) == 0, "Subject overlap between train and test!"
     assert len(set(val_subjects) & set(test_subjects)) == 0, "Subject overlap between validation and test!"
-    print("✓ No subject overlap confirmed - data leakage prevented!")
+    if config.verbose:
+        print("✓ No subject overlap confirmed - data leakage prevented!")
     
     # Create datasets with the corrected split
     # Training: Only normal data from training subjects
@@ -1285,14 +1511,15 @@ def main():
     test_dataset = BraTSPatchDataset(X_test, y_test)
     
     # Step 3: Create data loaders
-    print("\n3. Creating data loaders...")
-    
-    # UPDATED EXPLANATION: For proper unsupervised anomaly detection
-    print(f"\nCORRECTED ANOMALY DETECTION APPROACH:")
-    print(f"✓ Training: ONLY normal data (autoencoder learns normal patterns)")
-    print(f"✓ Validation: ONLY normal data (monitor overfitting on normal data)")  
-    print(f"✓ Testing: MIXED data (evaluate anomaly detection performance)")
-    print(f"✓ Anomaly Detection: High reconstruction error = Anomaly")
+    if config.verbose:
+        print("\n3. Creating data loaders...")
+        
+        # UPDATED EXPLANATION: For proper unsupervised anomaly detection
+        print(f"\nCORRECTED ANOMALY DETECTION APPROACH:")
+        print(f"✓ Training: ONLY normal data (autoencoder learns normal patterns)")
+        print(f"✓ Validation: ONLY normal data (monitor overfitting on normal data)")  
+        print(f"✓ Testing: MIXED data (evaluate anomaly detection performance)")
+        print(f"✓ Anomaly Detection: High reconstruction error = Anomaly")
     
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, 
                              shuffle=True, num_workers=config.num_workers)
@@ -1302,22 +1529,43 @@ def main():
                             shuffle=False, num_workers=config.num_workers)
     
     # Step 4: Initialize and train the autoencoder
-    print("\n4. Training 3D Autoencoder...")
+    if config.verbose:
+        print("\n4. Training 3D Autoencoder...")
     detector = AnomalyDetector(config)
     train_losses, val_losses = detector.train(train_loader, val_loader)
     
     # Step 5: Evaluate the model
-    print("\n5. Evaluating model on test set...")
+    if config.verbose:
+        print("\n5. Evaluating model on test set...")
     results = detector.evaluate(test_loader, val_loader)
     
     # Step 6: Create visualizations
-    print("\n6. Creating visualizations...")
+    if config.verbose:
+        print("\n6. Creating visualizations...")
     visualizer = Visualizer(config)
     visualizer.create_summary_report(results)
     
     # Step 7: Visualize sample patches
-    print("\n7. Visualizing sample patches...")
-    visualizer.visualize_3d_patches(X_test, y_test, config.num_samples_visualize)
+    if config.verbose:
+        print("\n7. Visualizing sample patches...")
+    visualizer.visualize_3d_patches(X_test, y_test, num_normal=100, num_anomaly=10)
+    
+    # Calculate total execution time before saving results
+    end_time = time.time()
+    total_time = end_time - start_time
+    
+    # Convert time to human-readable format
+    hours = int(total_time // 3600)
+    minutes = int((total_time % 3600) // 60)
+    seconds = int(total_time % 60)
+    
+    time_str = []
+    if hours > 0:
+        time_str.append(f"{hours}h")
+    if minutes > 0:
+        time_str.append(f"{minutes}m")
+    time_str.append(f"{seconds}s")
+    time_formatted = " ".join(time_str)
     
     # Save results to file
     results_file = os.path.join(config.output_dir, 'evaluation_results.txt')
@@ -1332,6 +1580,7 @@ def main():
         f.write(f"ROC AUC:           {results['roc_auc']:.4f}\n")
         f.write(f"Average Precision: {results['average_precision']:.4f}\n")
         f.write(f"Matthews Correlation: {results['mcc']:.4f}\n")
+        f.write(f"Dice Similarity Coeff: {results['dsc']:.4f}\n")
         f.write(f"Balanced Accuracy: {results['balanced_accuracy']:.4f}\n")
         f.write(f"F1 Score:          {results['f1_score']:.4f}\n")
         f.write(f"Precision:         {results['precision']:.4f}\n")
@@ -1353,14 +1602,25 @@ def main():
         f.write(f"  Training subjects: {len(train_subjects)}\n")
         f.write(f"  Validation subjects: {len(val_subjects)}\n")
         f.write(f"  Test subjects: {len(test_subjects)}\n")
+        f.write(f"  Anomaly labels used: {config.anomaly_labels}\n")
+        f.write(f"  Anomaly label descriptions: {anomaly_names}\n")
+        f.write("="*60 + "\n")
+        f.write(f"EXECUTION TIME:\n")
+        f.write(f"  Total time: {time_formatted} ({total_time:.1f} seconds)\n")
     
-    print(f"\nResults saved to: {results_file}")
-    print("\n" + "="*60)
-    print("PIPELINE COMPLETED SUCCESSFULLY!")
-    print("✓ Data leakage eliminated through subject-level splitting")
-    print("✓ Truly unsupervised threshold determination")
-    print("✓ No test label access during model development")
-    print("="*60)
+    if config.verbose:
+        print(f"\nResults saved to: {results_file}")
+        print("\n" + "="*60)
+        print("PIPELINE COMPLETED SUCCESSFULLY!")
+        print("✓ Data leakage eliminated through subject-level splitting")
+        print("✓ Truly unsupervised threshold determination")
+        print("✓ No test label access during model development")
+        print("="*60)
+        print(f"⏱️  TOTAL EXECUTION TIME: {time_formatted} ({total_time:.1f} seconds)")
+        print("="*60)
+    else:
+        # Minimal completion message
+        print(f"\nPipeline completed in {time_formatted}. Results saved to: {results_file}")
 
 
 if __name__ == "__main__":
