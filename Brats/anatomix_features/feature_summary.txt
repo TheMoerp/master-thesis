@@ -1,0 +1,12 @@
+Anatomix Feature Extraction Summary
+====================================
+Total samples: 1367
+Feature dimension: 64
+Normal samples: 883
+Anomalous samples: 484
+Unique subjects: 10
+Feature statistics:
+  Mean: 1.387954
+  Std: 4.107922
+  Min: -12.454665
+  Max: 21.937864
