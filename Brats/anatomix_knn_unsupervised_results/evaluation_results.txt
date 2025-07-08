@@ -1,0 +1,36 @@
+ANATOMIX + KNN UNSUPERVISED ANOMALY DETECTION RESULTS
+============================================================
+METHODOLOGY:
+- Anatomix pre-trained features for representation learning
+- KNN-based anomaly detection with FAISS for efficiency
+- Subject-level data splitting (no patient overlap)
+- Threshold determined using ONLY normal validation data
+- No test label access during threshold selection
+============================================================
+ROC AUC:           0.6527
+Average Precision: 0.5099
+Matthews Correlation: 0.2393
+Dice Similarity Coeff: 0.4452
+Balanced Accuracy: 0.6080
+F1 Score:          0.4452
+Precision:         0.5348
+Recall:            0.3812
+Specificity:       0.8347
+Accuracy:          0.6839
+Threshold Used:    13.421064
+============================================================
+Configuration:
+  Patch size: 32
+  Patches per volume: 50
+  K neighbors: 7
+  Feature dimension: 48
+  Training samples: 24000
+  Validation samples: 8000
+  Test samples: 11987
+  Training subjects: 240
+  Validation subjects: 80
+  Test subjects: 80
+  Anomaly labels used: [1, 2, 4]
+============================================================
+EXECUTION TIME:
+  Total time: 1h 21m 42s (4903.0 seconds)
