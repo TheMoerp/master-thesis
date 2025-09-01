@@ -1,0 +1,32 @@
+TRULY UNSUPERVISED 3D VQ-VAE Anomaly Detection Results (Script 2)
+============================================================
+ROC AUC:           0.5057
+Average Precision: 0.3414
+Matthews Correlation: 0.0383
+Dice Similarity Coeff: 0.1179
+Balanced Accuracy: 0.5094
+F1 Score:          0.1179
+Precision:         0.4059
+Recall:            0.0690
+Specificity:       0.9498
+Accuracy:          0.6572
+Threshold Used:    1.618180
+============================================================
+Configuration:
+  Patch size: 32
+  Patches per volume: 50
+  VQ embedding dim: 32
+  VQ num embeddings: 256
+  Commitment cost: 0.5
+  Learning rate: 5e-05
+  Batch size: 8
+  Number of epochs: 100
+  Training samples: 59974
+  Validation samples: 20000
+  Test samples: 29947
+  Training subjects: 600
+  Validation subjects: 200
+  Test subjects: 200
+  Anomaly labels used: [1, 2, 4]
+============================================================
+TOTAL EXECUTION TIME: 5h 40m 38s (20438.8 seconds)

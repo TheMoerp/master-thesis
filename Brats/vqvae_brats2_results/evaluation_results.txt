@@ -1,0 +1,35 @@
+TRULY UNSUPERVISED 3D VQ-VAE Anomaly Detection Results
+============================================================
+DATA LEAKAGE PREVENTION MEASURES:
+- Subject-level data splitting (no patient overlap)
+- Threshold determined using ONLY normal validation data
+- No test label access during threshold selection
+============================================================
+ROC AUC:           0.8482
+Average Precision: 0.7542
+Matthews Correlation: 0.5667
+Dice Similarity Coeff: 0.6506
+Balanced Accuracy: 0.7506
+F1 Score:          0.6506
+Precision:         0.7843
+Recall:            0.5558
+Specificity:       0.9454
+Accuracy:          0.8429
+Threshold Used:    0.015872
+============================================================
+Configuration:
+  Patch size: 32
+  Patches per volume: 50
+  VQ embedding dim: 128
+  Codebook size: 512
+  Commitment beta: 0.25
+  Learning rate: 5e-05
+  Batch size: 8
+  Number of epochs: 300
+  Training samples: 75000
+  Validation samples: 25000
+  Test samples: 34063
+  Anomaly labels used: [1, 4]
+============================================================
+EXECUTION TIME:
+  Total time: 7h 40m 35s (27635.5 seconds)

@@ -7,30 +7,30 @@ METHODOLOGY:
 - Threshold determined using ONLY normal validation data
 - No test label access during threshold selection
 ============================================================
-ROC AUC:           0.6527
-Average Precision: 0.5099
-Matthews Correlation: 0.2393
-Dice Similarity Coeff: 0.4452
-Balanced Accuracy: 0.6080
-F1 Score:          0.4452
-Precision:         0.5348
-Recall:            0.3812
-Specificity:       0.8347
-Accuracy:          0.6839
-Threshold Used:    13.421064
+ROC AUC:           0.6718
+Average Precision: 0.5376
+Matthews Correlation: 0.2667
+Dice Similarity Coeff: 0.4120
+Balanced Accuracy: 0.6062
+F1 Score:          0.4120
+Precision:         0.6092
+Recall:            0.3112
+Specificity:       0.9012
+Accuracy:          0.7059
+Threshold Used:    13.012067
 ============================================================
 Configuration:
   Patch size: 32
   Patches per volume: 50
   K neighbors: 7
   Feature dimension: 48
-  Training samples: 24000
-  Validation samples: 8000
-  Test samples: 11987
-  Training subjects: 240
-  Validation subjects: 80
-  Test subjects: 80
+  Training samples: 75000
+  Validation samples: 24974
+  Test samples: 37520
+  Training subjects: 750
+  Validation subjects: 250
+  Test subjects: 251
   Anomaly labels used: [1, 2, 4]
 ============================================================
 EXECUTION TIME:
-  Total time: 1h 21m 42s (4903.0 seconds)
+  Total time: 3h 56m 44s (14204.1 seconds)
