@@ -1,0 +1,19 @@
+TRULY UNSUPERVISED 3D Transformer-GAN Anomaly Detection Results
+============================================================
+ROC AUC:           0.8711
+Average Precision: 0.7812
+Balanced Accuracy: 0.7625
+F1 Score:          0.6712
+Precision:         0.8168
+Recall:            0.5696
+Threshold Used:    0.060071
+Test size: 8098 | Normal: 6000 | Anomaly: 2098
+Pred anomaly rate: 0.181
+============================================================
+Configuration:
+  Patch size: 32
+  Patches per volume: 50
+  Learning rate: 0.0002
+  Batch size: 8
+  Number of epochs: 100
+  Anomaly labels used: [1, 4]
