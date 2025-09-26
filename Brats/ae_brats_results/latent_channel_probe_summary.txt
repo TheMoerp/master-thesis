@@ -1,0 +1,4 @@
+Latent Channel Probe Summary
+========================================
+Num channels: 256
+Top-k indices by |weight|: 92, 174, 186, 156, 175, 145, 59, 74, 49, 254, 184, 143, 1, 105, 161, 117
