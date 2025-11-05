@@ -1,0 +1,27 @@
+TRULY UNSUPERVISED VQ-VAE Encoder + KNN Anomaly Detection Results
+============================================================
+ROC AUC:           0.8670
+Average Precision: 0.7735
+Balanced Accuracy: 0.7574
+F1 Score:          0.6651
+Precision:         0.8294
+Recall:            0.5551
+Specificity:       0.9598
+Accuracy:          0.8543
+MCC:               0.5956
+DSC:               0.6651
+Threshold Used:    0.124815
+============================================================
+Configuration:
+  Patch size: 32
+  Patches per volume: 50
+  K neighbors: 7
+  Threshold percentile: 95.0
+  Feature pooling: mean
+  Training samples: 75000
+  Validation samples: 25000
+  Test samples: 33945
+  Training subjects: 750
+  Validation subjects: 250
+  Test subjects: 251
+  Anomaly labels used: [1, 4]

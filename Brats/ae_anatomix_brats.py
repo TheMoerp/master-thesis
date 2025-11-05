@@ -331,23 +331,26 @@ def visualize_results(true_labels, anomaly_scores, pred_labels, results):
     # ROC Curve
     from sklearn.metrics import roc_curve
     fpr, tpr, _ = roc_curve(true_labels, anomaly_scores)
-    axes[0, 0].plot(fpr, tpr, label=f'ROC AUC = {results["ROC AUC"]:.3f}')
-    axes[0, 0].plot([0, 1], [0, 1], 'k--')
-    axes[0, 0].set_xlabel('False Positive Rate')
-    axes[0, 0].set_ylabel('True Positive Rate')
+    axes[0, 0].plot(fpr, tpr, color="#1f77b4", lw=2, label=f'ROC (AUC = {results["ROC AUC"]:.2f})')
+    axes[0, 0].fill_between(fpr, tpr, step="pre", alpha=0.25, color="#aec7e8")
+    axes[0, 0].plot([0, 1], [0, 1], linestyle='--', color="#888888", lw=1, label='Chance')
+    axes[0, 0].set_xlabel('FPR')
+    axes[0, 0].set_ylabel('TPR')
     axes[0, 0].set_title('ROC Curve')
-    axes[0, 0].legend()
-    axes[0, 0].grid(True)
+    axes[0, 0].legend(loc='lower right')
+    axes[0, 0].grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
     
     # Precision-Recall Curve
-    from sklearn.metrics import precision_recall_curve
+    from sklearn.metrics import precision_recall_curve, auc as sk_auc
     precision_curve, recall_curve, _ = precision_recall_curve(true_labels, anomaly_scores)
-    axes[0, 1].plot(recall_curve, precision_curve, label=f'AP = {results["Average Precision"]:.3f}')
+    pr_auc_value = sk_auc(recall_curve, precision_curve)
+    axes[0, 1].plot(recall_curve, precision_curve, color="#ff7f0e", lw=2, label=f'PR (AUC = {pr_auc_value:.2f})')
+    axes[0, 1].fill_between(recall_curve, precision_curve, step="pre", alpha=0.25, color="#ffbb78")
     axes[0, 1].set_xlabel('Recall')
     axes[0, 1].set_ylabel('Precision')
     axes[0, 1].set_title('Precision-Recall Curve')
-    axes[0, 1].legend()
-    axes[0, 1].grid(True)
+    axes[0, 1].legend(loc='lower left')
+    axes[0, 1].grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
     
     # Anomaly Score Distribution
     normal_scores = anomaly_scores[true_labels == 0]

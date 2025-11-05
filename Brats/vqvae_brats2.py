@@ -34,7 +34,7 @@ from torch.cuda.amp import autocast, GradScaler
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, accuracy_score,
     precision_score, recall_score, f1_score, confusion_matrix,
-    roc_curve, precision_recall_curve
+    roc_curve, precision_recall_curve, auc as sk_auc
 )
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
@@ -88,7 +88,7 @@ class Config:
 
         # VQ-VAE specific parameters
         self.codebook_size = 512
-        self.embedding_dim = 128
+        self.embedding_dim = 256
         self.commitment_beta = 0.25
 
         # Training parameters
@@ -176,24 +176,27 @@ class VectorQuantizer(nn.Module):
 
 
 class VQVAE3D(nn.Module):
-    def __init__(self, input_channels: int = 1, embedding_dim: int = 128, codebook_size: int = 512,
+    def __init__(self, input_channels: int = 1, embedding_dim: int = 256, codebook_size: int = 512,
                  commitment_beta: float = 0.25):
         super().__init__()
         self.embedding_dim = embedding_dim
 
-        # Encoder: 32 -> 16 -> 8 -> 4
+        # Encoder: 32 -> 16 -> 8 -> 4 using stride-1 convs + MaxPool3d
         self.encoder = nn.Sequential(
-            nn.Conv3d(input_channels, 32, kernel_size=4, stride=2, padding=1),
+            nn.Conv3d(input_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
+            nn.MaxPool3d(2),
 
-            nn.Conv3d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
+            nn.MaxPool3d(2),
 
-            nn.Conv3d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(128),
             nn.ReLU(inplace=True),
+            nn.MaxPool3d(2),
 
             nn.Conv3d(128, embedding_dim, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(embedding_dim),
@@ -204,19 +207,22 @@ class VQVAE3D(nn.Module):
                                          embedding_dim=embedding_dim,
                                          commitment_cost=commitment_beta)
 
-        # Decoder: 4 -> 8 -> 16 -> 32
+        # Decoder: 4 -> 8 -> 16 -> 32 using Upsample + stride-1 convs (3x3x3)
         self.decoder = nn.Sequential(
-            nn.ConvTranspose3d(embedding_dim, 128, kernel_size=4, stride=2, padding=1),
+            nn.Conv3d(embedding_dim, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(128),
             nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
 
-            nn.ConvTranspose3d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.Conv3d(128, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
 
-            nn.ConvTranspose3d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.Conv3d(64, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
+            nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
 
             nn.Conv3d(32, input_channels, kernel_size=3, stride=1, padding=1),
             nn.Sigmoid(),
@@ -719,30 +725,32 @@ class Visualizer:
         fpr, tpr, _ = roc_curve(true_labels, reconstruction_errors)
         auc = roc_auc_score(true_labels, reconstruction_errors)
         plt.figure(figsize=(8, 6))
-        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auc:.4f})')
-        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random')
+        plt.plot(fpr, tpr, color="#1f77b4", lw=2, label=f"ROC (AUC = {auc:.2f})")
+        plt.fill_between(fpr, tpr, step="pre", alpha=0.25, color="#aec7e8")
+        plt.plot([0, 1], [0, 1], linestyle="--", color="#888888", lw=1, label="Chance")
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('Receiver Operating Characteristic (ROC) Curve')
-        plt.legend(loc="lower right")
-        plt.grid(True, alpha=0.3)
+        plt.xlabel('FPR')
+        plt.ylabel('TPR')
+        plt.title('ROC Curve')
+        plt.legend(loc='lower right')
+        plt.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
         plt.savefig(os.path.join(self.config.output_dir, 'roc_curve.png'), dpi=300, bbox_inches='tight')
         plt.close()
 
     def plot_precision_recall_curve(self, true_labels: np.ndarray, reconstruction_errors: np.ndarray):
         precision, recall, _ = precision_recall_curve(true_labels, reconstruction_errors)
-        avg_precision = average_precision_score(true_labels, reconstruction_errors)
+        pr_auc_value = sk_auc(recall, precision)
         plt.figure(figsize=(8, 6))
-        plt.plot(recall, precision, color='blue', lw=2, label=f'PR curve (AP = {avg_precision:.4f})')
+        plt.plot(recall, precision, color="#ff7f0e", lw=2, label=f"PR (AUC = {pr_auc_value:.2f})")
+        plt.fill_between(recall, precision, step="pre", alpha=0.25, color="#ffbb78")
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
         plt.xlabel('Recall')
         plt.ylabel('Precision')
         plt.title('Precision-Recall Curve')
-        plt.legend(loc="lower left")
-        plt.grid(True, alpha=0.3)
+        plt.legend(loc='lower left')
+        plt.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
         plt.savefig(os.path.join(self.config.output_dir, 'precision_recall_curve.png'), dpi=300, bbox_inches='tight')
         plt.close()
 

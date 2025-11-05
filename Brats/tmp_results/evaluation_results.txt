@@ -1,0 +1,26 @@
+TRULY UNSUPERVISED Anatomix+KNN Anomaly Detection Results
+============================================================
+ROC AUC:           0.7602
+Average Precision: 0.5764
+Balanced Accuracy: 0.6281
+F1 Score:          0.4253
+Precision:         0.6717
+Recall:            0.3112
+Specificity:       0.9449
+Accuracy:          0.7765
+MCC:               0.3443
+DSC:               0.4253
+Threshold Used:    0.606700
+============================================================
+Configuration:
+  Patch size: 32
+  Patches per volume: 50
+  K neighbors: 7
+  Threshold percentile: 95.0
+  Training samples: 75000
+  Validation samples: 25000
+  Test samples: 34184
+  Training subjects: 750
+  Validation subjects: 250
+  Test subjects: 251
+  Anomaly labels used: [1, 4]

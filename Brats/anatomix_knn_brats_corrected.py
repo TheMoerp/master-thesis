@@ -638,13 +638,14 @@ class Visualizer:
         auc = roc_auc_score(true_labels, anomaly_scores)
         
         plt.figure(figsize=(8, 6))
-        plt.plot(fpr, tpr, linewidth=2, label=f'ROC Curve (AUC = {auc:.3f})')
-        plt.plot([0, 1], [0, 1], 'k--', alpha=0.5, label='Random Classifier')
+        plt.plot(fpr, tpr, color="#1f77b4", lw=2, label=f'ROC (AUC = {auc:.2f})')
+        plt.fill_between(fpr, tpr, step='pre', alpha=0.25, color="#aec7e8")
+        plt.plot([0, 1], [0, 1], linestyle='--', color="#888888", lw=1, label='Chance')
         
-        plt.xlabel('False Positive Rate', fontsize=12)
-        plt.ylabel('True Positive Rate', fontsize=12)
-        plt.title('ROC Curve - Corrected Anatomix KNN', fontsize=14, fontweight='bold')
-        plt.legend(fontsize=11)
+        plt.xlabel('FPR', fontsize=12)
+        plt.ylabel('TPR', fontsize=12)
+        plt.title('ROC Curve', fontsize=14, fontweight='bold')
+        plt.legend(loc='lower right', fontsize=11)
         plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
@@ -658,17 +659,13 @@ class Visualizer:
         ap = average_precision_score(true_labels, anomaly_scores)
         
         plt.figure(figsize=(8, 6))
-        plt.plot(recall, precision, linewidth=2, label=f'PR Curve (AP = {ap:.3f})')
-        
-        # Add baseline (proportion of positive class)
-        baseline = np.sum(true_labels) / len(true_labels)
-        plt.axhline(y=baseline, color='k', linestyle='--', alpha=0.5, 
-                   label=f'Baseline (AP = {baseline:.3f})')
+        plt.plot(recall, precision, color="#ff7f0e", lw=2, label=f'PR (AUC = {ap:.2f})')
+        plt.fill_between(recall, precision, step='pre', alpha=0.25, color="#ffbb78")
         
         plt.xlabel('Recall', fontsize=12)
         plt.ylabel('Precision', fontsize=12)
-        plt.title('Precision-Recall Curve - Corrected Anatomix KNN', fontsize=14, fontweight='bold')
-        plt.legend(fontsize=11)
+        plt.title('Precision-Recall Curve', fontsize=14, fontweight='bold')
+        plt.legend(loc='lower left', fontsize=11)
         plt.grid(True, alpha=0.3)
         
         plt.tight_layout()

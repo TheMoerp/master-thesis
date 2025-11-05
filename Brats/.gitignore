@@ -10,3 +10,4 @@ BraTS*
 anatomix/
 anatomix_ae_results/
 env_packages/
+.venv/

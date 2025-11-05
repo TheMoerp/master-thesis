@@ -52,7 +52,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score, average_precision_score, accuracy_score,
     precision_score, recall_score, f1_score, confusion_matrix,
-    roc_curve, precision_recall_curve
+    roc_curve, precision_recall_curve, auc as sk_auc
 )
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
@@ -191,6 +191,7 @@ class Autoencoder3D(nn.Module):
             nn.BatchNorm3d(256),
             nn.ReLU(inplace=True)
         )
+        # 4 encoder stages total (stop at 4x4x4 spatial resolution)
         
         # Latent space
         self.flatten = nn.Flatten()
@@ -210,7 +211,9 @@ class Autoencoder3D(nn.Module):
         )
         self.unflatten = nn.Unflatten(1, (256, 4, 4, 4))
         
-        # Decoder with skip connections
+        # Decoder with symmetric depth (matching 4-stage encoder)
+        
+        # Continue existing decoder path
         self.decoder_conv4 = nn.Sequential(
             nn.Conv3d(256, 256, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(256),
@@ -1117,17 +1120,18 @@ class Visualizer:
         """Plot ROC curve"""
         fpr, tpr, _ = roc_curve(true_labels, reconstruction_errors)
         auc = roc_auc_score(true_labels, reconstruction_errors)
-        
+
         plt.figure(figsize=(8, 6))
-        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auc:.4f})')
-        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random')
+        plt.plot(fpr, tpr, color="#1f77b4", lw=2, label=f"ROC (AUC = {auc:.2f})")
+        plt.fill_between(fpr, tpr, step="pre", alpha=0.25, color="#aec7e8")
+        plt.plot([0, 1], [0, 1], linestyle="--", color="#888888", lw=1, label="Chance")
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('Receiver Operating Characteristic (ROC) Curve')
-        plt.legend(loc="lower right")
-        plt.grid(True, alpha=0.3)
+        plt.xlabel('FPR')
+        plt.ylabel('TPR')
+        plt.title('ROC Curve')
+        plt.legend(loc='lower right')
+        plt.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
         plt.savefig(os.path.join(self.config.output_dir, 'roc_curve.png'), 
                    dpi=300, bbox_inches='tight')
         plt.close()
@@ -1135,18 +1139,18 @@ class Visualizer:
     def plot_precision_recall_curve(self, true_labels: np.ndarray, reconstruction_errors: np.ndarray):
         """Plot Precision-Recall curve"""
         precision, recall, _ = precision_recall_curve(true_labels, reconstruction_errors)
-        avg_precision = average_precision_score(true_labels, reconstruction_errors)
-        
+        pr_auc_value = sk_auc(recall, precision)
+
         plt.figure(figsize=(8, 6))
-        plt.plot(recall, precision, color='blue', lw=2, 
-                label=f'PR curve (AP = {avg_precision:.4f})')
+        plt.plot(recall, precision, color="#ff7f0e", lw=2, label=f"PR (AUC = {pr_auc_value:.2f})")
+        plt.fill_between(recall, precision, step="pre", alpha=0.25, color="#ffbb78")
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
         plt.xlabel('Recall')
         plt.ylabel('Precision')
         plt.title('Precision-Recall Curve')
-        plt.legend(loc="lower left")
-        plt.grid(True, alpha=0.3)
+        plt.legend(loc='lower left')
+        plt.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
         plt.savefig(os.path.join(self.config.output_dir, 'precision_recall_curve.png'), 
                    dpi=300, bbox_inches='tight')
         plt.close()
@@ -1625,3 +1629,4 @@ def main():
 
 if __name__ == "__main__":
     main() 
+

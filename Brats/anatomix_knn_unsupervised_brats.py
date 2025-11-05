@@ -2234,13 +2234,14 @@ class Visualizer:
         auc = roc_auc_score(true_labels, anomaly_scores)
         
         plt.figure(figsize=(8, 6))
-        plt.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {auc:.4f})')
-        plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', label='Random')
+        plt.plot(fpr, tpr, color="#1f77b4", lw=2, label=f'ROC (AUC = {auc:.2f})')
+        plt.fill_between(fpr, tpr, step="pre", alpha=0.25, color="#aec7e8")
+        plt.plot([0, 1], [0, 1], linestyle='--', color='#888888', lw=1, label='Chance')
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
-        plt.xlabel('False Positive Rate')
-        plt.ylabel('True Positive Rate')
-        plt.title('ROC Curve - Anatomix + KNN')
+        plt.xlabel('FPR')
+        plt.ylabel('TPR')
+        plt.title('ROC Curve')
         plt.legend(loc="lower right")
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.config.output_dir, 'roc_curve.png'), 
@@ -2253,13 +2254,13 @@ class Visualizer:
         avg_precision = average_precision_score(true_labels, anomaly_scores)
         
         plt.figure(figsize=(8, 6))
-        plt.plot(recall, precision, color='blue', lw=2, 
-                label=f'PR curve (AP = {avg_precision:.4f})')
+        plt.plot(recall, precision, color='#ff7f0e', lw=2, label=f'PR (AUC = {avg_precision:.2f})')
+        plt.fill_between(recall, precision, step='pre', alpha=0.25, color='#ffbb78')
         plt.xlim([0.0, 1.0])
         plt.ylim([0.0, 1.05])
         plt.xlabel('Recall')
         plt.ylabel('Precision')
-        plt.title('Precision-Recall Curve - Anatomix + KNN')
+        plt.title('Precision-Recall Curve')
         plt.legend(loc="lower left")
         plt.grid(True, alpha=0.3)
         plt.savefig(os.path.join(self.config.output_dir, 'precision_recall_curve.png'), 

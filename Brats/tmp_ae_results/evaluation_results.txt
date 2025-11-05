@@ -1,0 +1,37 @@
+TRULY UNSUPERVISED 3D Autoencoder Anomaly Detection Results
+============================================================
+DATA LEAKAGE PREVENTION MEASURES:
+- Subject-level data splitting (no patient overlap)
+- Threshold determined using ONLY normal validation data
+- No test label access during threshold selection
+============================================================
+ROC AUC:           0.8967
+Average Precision: 0.8343
+Matthews Correlation: 0.6636
+Dice Similarity Coeff: 0.7406
+Balanced Accuracy: 0.8094
+F1 Score:          0.7406
+Precision:         0.8256
+Recall:            0.6715
+Specificity:       0.9474
+Accuracy:          0.8727
+Threshold Used:    0.026724
+============================================================
+Configuration:
+  Patch size: 32
+  Patches per volume: 50
+  Latent dimension: 64
+  Learning rate: 5e-05
+  Batch size: 8
+  Number of epochs: 300
+  Training samples: 75000
+  Validation samples: 25000
+  Test samples: 34415
+  Training subjects: 750
+  Validation subjects: 250
+  Test subjects: 251
+  Anomaly labels used: [1, 4]
+  Anomaly label descriptions: ['1', '4']
+============================================================
+EXECUTION TIME:
+  Total time: 10h 45m 53s (38753.2 seconds)

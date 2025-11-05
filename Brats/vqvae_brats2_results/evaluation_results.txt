@@ -5,17 +5,17 @@ DATA LEAKAGE PREVENTION MEASURES:
 - Threshold determined using ONLY normal validation data
 - No test label access during threshold selection
 ============================================================
-ROC AUC:           0.8533
-Average Precision: 0.7661
-Matthews Correlation: 0.5721
-Dice Similarity Coeff: 0.6466
-Balanced Accuracy: 0.7457
-F1 Score:          0.6466
-Precision:         0.8165
-Recall:            0.5352
-Specificity:       0.9562
-Accuracy:          0.8438
-Threshold Used:    0.016390
+ROC AUC:           0.8240
+Average Precision: 0.7330
+Matthews Correlation: 0.5527
+Dice Similarity Coeff: 0.6285
+Balanced Accuracy: 0.7352
+F1 Score:          0.6285
+Precision:         0.8043
+Recall:            0.5158
+Specificity:       0.9547
+Accuracy:          0.8382
+Threshold Used:    0.014946
 ============================================================
 Configuration:
   Patch size: 32
@@ -28,8 +28,8 @@ Configuration:
   Number of epochs: 300
   Training samples: 75000
   Validation samples: 25000
-  Test samples: 34239
+  Test samples: 34166
   Anomaly labels used: [1, 4]
 ============================================================
 EXECUTION TIME:
-  Total time: 7h 8m 50s (25730.0 seconds)
+  Total time: 11h 51m 41s (42701.9 seconds)
