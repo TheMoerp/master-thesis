@@ -1,5 +1,0 @@
-Label-Farben (BraTS):
-1 -> Rot (Nekrotisch/Nicht-Enhancing Tumorkern, NCR/NET)
-2 -> Gelb (Peritumorales Ödem, ED)
-3 -> Magenta (optional, falls vorhanden)
-4 -> Blau (Enhancing Tumor, ET)
