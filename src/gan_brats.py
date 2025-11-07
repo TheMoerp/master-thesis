@@ -1,25 +1,4 @@
 #!/usr/bin/env python3
-"""
-Generative-based Anomaly Detection for BraTS (3D f-AnoGAN-style)
-
-This script implements a generative 3D DCGAN + encoder (f-AnoGAN approach) for
-unsupervised anomaly detection on BraTS patches. It reuses the same
-preprocessing pipeline, subject-level splitting, and evaluation metrics flow as
-in ae_brats.py, but uses a generative model:
-
-Pipeline summary:
-- Train 3D GAN (Generator G, Discriminator D) on NORMAL patches only
-- Train an Encoder E (with G and D frozen) to map x -> z such that G(z) ≈ x
-- Anomaly score per patch = α * residual_loss(x, G(E(x)))
-  + (1-α) * feature_loss(D_feats(x), D_feats(G(E(x))))
-- Threshold set using ONLY normal validation scores (e.g., 95th percentile)
-- Evaluate on mixed test set with same metrics as ae_brats.py
-
-Outputs:
-- Models: best_gan_generator.pth, best_gan_discriminator.pth, best_encoder.pth
-- Plots: confusion matrix, ROC, PR, error histogram, latent visualization
-- Report: gan_brats_results/evaluation_results.txt
-"""
 
 import os
 import argparse

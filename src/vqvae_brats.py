@@ -1,12 +1,4 @@
 #!/usr/bin/env python3
-"""
-3D VQ-VAE-based Anomaly Detection for BraTS Dataset
-
-This program mirrors the pipeline of ae_brats.py (patch extraction, subject-level
-splitting, unsupervised training on normal patches, thresholding on normal
-validation errors, and evaluation on mixed test data), but replaces the model
-with a 3D Vector-Quantized VAE (VQ-VAE).
-"""
 
 import os
 import argparse

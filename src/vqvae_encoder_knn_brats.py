@@ -1,13 +1,4 @@
 #!/usr/bin/env python3
-"""
-VQ-VAE Encoder features + KNN anomaly detection on BraTS patches
-
-Pipeline:
-- Reuse the dataset/patch extraction from vqvae_brats2.py (subject-level split)
-- Use ONLY the VQ-VAE encoder to extract latent features (no quantizer/decoder)
-- Train KNN on NORMAL train features, threshold from NORMAL validation scores
-- Evaluate on mixed test patches and generate visualizations
-"""
 
 import os
 import argparse

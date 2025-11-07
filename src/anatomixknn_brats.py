@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-Anatomix feature extractor + KNN unsupervised anomaly detection on BraTS
-
-Requirements derived from user brief:
-- Use EXACT SAME preprocessing/patch pipeline and CLI parameter style as ae_brats.py
-- Use Anatomix as feature extractor on patches
-- Train KNN anomaly detector in a truly unsupervised way:
-  - Train/Val on NORMAL patches only (subject-level split)
-  - Determine threshold from normal validation scores only
-  - Test on mixed patches
-- Default anomaly labels: [1, 4] (NCR/NET and Enhancing Tumor), but keep the same CLI (allow override)
-- Keep same metrics and report style as ae_brats.py
-"""
 
 import os
 import sys

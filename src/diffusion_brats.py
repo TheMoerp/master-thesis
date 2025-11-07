@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-Diffusion-based Anomaly Detection for BraTS (3D DDPM-style)
-
-This script mirrors gan_brats.py's preprocessing, subject-level split, metrics,
-and reporting, but uses a denoising diffusion probabilistic model (DDPM) with a
-3D U-Net denoiser trained on NORMAL patches only. Anomaly score is computed as
-the average denoising MSE across random timesteps (no supervision).
-
-Outputs:
-- Model: best_diffusion_unet.pth
-- Plots: confusion matrix, ROC, PR, score histogram
-- Report: diffusion_brats_results/evaluation_results.txt
-"""
 
 import os
 import argparse

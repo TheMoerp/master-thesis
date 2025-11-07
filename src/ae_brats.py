@@ -1,27 +1,4 @@
 #!/usr/bin/env python3
-"""
-3D Autoencoder-based Anomaly Detection for BraTS Dataset
-
-This program implements a 3D Convolutional Autoencoder for UNSUPERVISED anomaly detection 
-on the BraTS dataset. The autoencoder is trained ONLY on normal patches (without tumor) 
-and learns to reconstruct normal brain tissue patterns. High reconstruction errors indicate 
-anomalies (tumors).
-
-CORRECTED APPROACH:
-- Training: Only normal patches (unsupervised learning)
-- Validation: Only normal patches (monitor overfitting)
-- Testing: Mixed normal + anomalous patches (evaluate detection performance)
-- Detection: Reconstruction error threshold determines anomalies
-
-Features:
-- Proper unsupervised anomaly detection methodology
-- 3D patch extraction from volumes with quality validation
-- GPU acceleration for all compute-intensive operations
-- Real progress bars during training
-- Comprehensive evaluation metrics for anomaly detection
-- Multiple visualization options
-- Configurable parameters via command line arguments
-"""
 
 import os
 import argparse
