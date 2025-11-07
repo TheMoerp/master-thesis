@@ -148,34 +148,62 @@ class VQVAE3D(nn.Module):
                  commitment_beta: float = 0.25):
         super().__init__()
         self.embedding_dim = embedding_dim
-        self.encoder = nn.Sequential(
+
+        # Encoder aligned with vqvae_brats2.py (and ae_brats.py depth):
+        self.encoder_conv1 = nn.Sequential(
             nn.Conv3d(input_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
+            nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.pool1 = nn.MaxPool3d(2)
 
+        self.encoder_conv2 = nn.Sequential(
             nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
+            nn.Conv3d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.pool2 = nn.MaxPool3d(2)
 
+        self.encoder_conv3 = nn.Sequential(
             nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(128),
             nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
+            nn.Conv3d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.pool3 = nn.MaxPool3d(2)
 
+        self.encoder_conv4 = nn.Sequential(
             nn.Conv3d(128, embedding_dim, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(embedding_dim),
             nn.ReLU(inplace=True),
+            nn.Conv3d(embedding_dim, embedding_dim, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(embedding_dim),
+            nn.ReLU(inplace=True),
         )
+
+        # Quantizer defined but not used in KNN pipeline
         self.quantizer = VectorQuantizer(num_embeddings=codebook_size,
                                          embedding_dim=embedding_dim,
                                          commitment_cost=commitment_beta)
-        # Decoder defined in original model but unused here
         self.decoder = nn.Identity()
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
+        e1 = self.encoder_conv1(x)
+        e1_pool = self.pool1(e1)
+        e2 = self.encoder_conv2(e1_pool)
+        e2_pool = self.pool2(e2)
+        e3 = self.encoder_conv3(e2_pool)
+        e3_pool = self.pool3(e3)
+        e4 = self.encoder_conv4(e3_pool)
+        return e4
 
 
 class BraTSDataProcessor:
@@ -631,7 +659,7 @@ def main():
     model = VQVAE3D(input_channels=1, embedding_dim=cfg.embedding_dim, codebook_size=512, commitment_beta=0.25).to(cfg.device)
     
     def _safe_load_encoder_weights(model_obj, state_dict):
-        # Strip potential 'module.' prefix and load only matching encoder weights
+        # Strip potential 'module.' prefix and load only matching encoder block weights
         normalized = {}
         for k, v in state_dict.items():
             nk = k[7:] if k.startswith('module.') else k
@@ -640,8 +668,11 @@ def main():
         to_load = {}
         total_enc = 0
         loaded = 0
+        encoder_block_prefixes = (
+            'encoder_conv1', 'encoder_conv2', 'encoder_conv3', 'encoder_conv4'
+        )
         for k, v in normalized.items():
-            if k.startswith('encoder.'):
+            if k.startswith(encoder_block_prefixes):
                 total_enc += 1
                 if k in model_sd and model_sd[k].shape == v.shape:
                     to_load[k] = v

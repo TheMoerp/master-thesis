@@ -1,6 +1,6 @@
 TRULY UNSUPERVISED VQ-VAE Encoder + KNN Anomaly Detection Results
 ============================================================
-ROC AUC:           0.8896
+ROC AUC:           0.8902
 Average Precision: 0.8213
 Balanced Accuracy: 0.8026
 F1 Score:          0.7336

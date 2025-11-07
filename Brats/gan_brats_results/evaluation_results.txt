@@ -1,0 +1,40 @@
+TRULY UNSUPERVISED 3D Generative (f-AnoGAN) Anomaly Detection Results
+============================================================
+DATA LEAKAGE PREVENTION MEASURES:
+- Subject-level data splitting (no patient overlap)
+- Threshold determined using ONLY normal validation data
+- No test label access during threshold selection
+============================================================
+ROC AUC:           0.8997
+Average Precision: 0.8496
+Matthews Correlation: 0.7004
+Dice Similarity Coeff: 0.7711
+Balanced Accuracy: 0.8317
+F1 Score:          0.7711
+Precision:         0.8388
+Recall:            0.7135
+Specificity:       0.9499
+Accuracy:          0.8866
+Threshold Used:    0.073784
+============================================================
+Configuration:
+  Patch size: 32
+  Patches per volume: 50
+  Latent dimension: 128
+  G LR: 0.0002
+  D LR: 0.0002
+  E LR: 0.0001
+  Batch size: 8
+  GAN epochs: 180
+  Encoder epochs: 80
+  Training samples: 75000
+  Validation samples: 25000
+  Test samples: 34272
+  Training subjects: 750
+  Validation subjects: 250
+  Test subjects: 251
+  Anomaly labels used: [1, 4]
+  Anomaly label descriptions: ['1 (NCR/NET (Necrotic/Non-enhancing))', '4 (ET (Enhancing Tumor))']
+============================================================
+EXECUTION TIME:
+  Total time: 17h 16m 17s (62177.3 seconds)

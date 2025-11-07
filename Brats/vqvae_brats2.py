@@ -181,58 +181,113 @@ class VQVAE3D(nn.Module):
         super().__init__()
         self.embedding_dim = embedding_dim
 
-        # Encoder: 32 -> 16 -> 8 -> 4 using stride-1 convs + MaxPool3d
-        self.encoder = nn.Sequential(
+        # Encoder structure aligned with Autoencoder3D (same stages/blocks),
+        # but final channels are embedding_dim to feed the VQ quantizer.
+        self.encoder_conv1 = nn.Sequential(
             nn.Conv3d(input_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
+            nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+        )
+        self.pool1 = nn.MaxPool3d(2)  # 32->16
 
+        self.encoder_conv2 = nn.Sequential(
             nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
+            nn.Conv3d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.pool2 = nn.MaxPool3d(2)  # 16->8
 
+        self.encoder_conv3 = nn.Sequential(
             nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(128),
             nn.ReLU(inplace=True),
-            nn.MaxPool3d(2),
+            nn.Conv3d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+        )
+        self.pool3 = nn.MaxPool3d(2)  # 8->4
 
+        self.encoder_conv4 = nn.Sequential(
             nn.Conv3d(128, embedding_dim, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(embedding_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(embedding_dim, embedding_dim, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(embedding_dim),
             nn.ReLU(inplace=True),
         )
 
-        self.quantizer = VectorQuantizer(num_embeddings=codebook_size,
-                                         embedding_dim=embedding_dim,
-                                         commitment_cost=commitment_beta)
+        # Vector Quantizer operates on deepest feature map (B, embedding_dim, 4, 4, 4)
+        self.quantizer = VectorQuantizer(
+            num_embeddings=codebook_size,
+            embedding_dim=embedding_dim,
+            commitment_cost=commitment_beta,
+        )
 
-        # Decoder: 4 -> 8 -> 16 -> 32 using Upsample + stride-1 convs (3x3x3)
-        self.decoder = nn.Sequential(
+        # Decoder structure aligned with Autoencoder3D (mirror of encoder),
+        # starting from the quantized feature map.
+        self.decoder_conv4 = nn.Sequential(
+            nn.Conv3d(embedding_dim, embedding_dim, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(embedding_dim),
+            nn.ReLU(inplace=True),
             nn.Conv3d(embedding_dim, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(128),
             nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
+        )
+        self.upsample3 = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)  # 4->8
 
+        self.decoder_conv3 = nn.Sequential(
+            nn.Conv3d(128, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
             nn.Conv3d(128, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
+        )
+        self.upsample2 = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)  # 8->16
 
+        self.decoder_conv2 = nn.Sequential(
+            nn.Conv3d(64, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
             nn.Conv3d(64, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
-            nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False),
+        )
+        self.upsample1 = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=False)  # 16->32
 
+        self.decoder_conv1 = nn.Sequential(
+            nn.Conv3d(32, 32, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
             nn.Conv3d(32, input_channels, kernel_size=3, stride=1, padding=1),
             nn.Sigmoid(),
         )
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
+        e1 = self.encoder_conv1(x)
+        e1_pool = self.pool1(e1)
+        e2 = self.encoder_conv2(e1_pool)
+        e2_pool = self.pool2(e2)
+        e3 = self.encoder_conv3(e2_pool)
+        e3_pool = self.pool3(e3)
+        e4 = self.encoder_conv4(e3_pool)
+        return e4
 
     def decode(self, z_q: torch.Tensor) -> torch.Tensor:
-        return self.decoder(z_q)
+        d4 = self.decoder_conv4(z_q)
+        d4_up = self.upsample3(d4)
+        d3 = self.decoder_conv3(d4_up)
+        d3_up = self.upsample2(d3)
+        d2 = self.decoder_conv2(d3_up)
+        d2_up = self.upsample1(d2)
+        out = self.decoder_conv1(d2_up)
+        return out
 
     def forward(self, x: torch.Tensor):
         z_e = self.encode(x)
@@ -585,9 +640,18 @@ class VQVAEAnomalyDetector:
     def evaluate(self, test_loader: DataLoader, val_loader: DataLoader) -> Dict:
         model_path = os.path.join(self.config.output_dir, 'best_vqvae_3d.pth')
         if os.path.exists(model_path):
-            self.model.load_state_dict(torch.load(model_path))
-            if getattr(self.config, 'verbose', False):
-                print("Loaded best VQ-VAE model for evaluation")
+            try:
+                state_dict = torch.load(model_path, map_location=self.config.device)
+                # Load only if checkpoint matches new architecture naming
+                if any(k.startswith('encoder_conv1') for k in state_dict.keys()):
+                    self.model.load_state_dict(state_dict, strict=True)
+                    if getattr(self.config, 'verbose', False):
+                        print("Loaded best VQ-VAE model for evaluation")
+                else:
+                    # Incompatible (old) checkpoint; skip loading and use current in-memory weights
+                    print("WARNING: Checkpoint incompatible with current architecture. Using in-memory model weights.")
+            except Exception as e:
+                print(f"WARNING: Failed to load checkpoint due to: {e}. Using in-memory model weights.")
         optimal_threshold = self.find_unsupervised_threshold(val_loader)
         reconstruction_errors, true_labels, latent_features = self.calculate_reconstruction_errors(test_loader)
         print(f"\nEVALUATION: Truly Unsupervised Anomaly Detection Results")

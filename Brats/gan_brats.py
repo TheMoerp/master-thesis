@@ -1,0 +1,1192 @@
+#!/usr/bin/env python3
+"""
+Generative-based Anomaly Detection for BraTS (3D f-AnoGAN-style)
+
+This script implements a generative 3D DCGAN + encoder (f-AnoGAN approach) for
+unsupervised anomaly detection on BraTS patches. It reuses the same
+preprocessing pipeline, subject-level splitting, and evaluation metrics flow as
+in ae_brats.py, but uses a generative model:
+
+Pipeline summary:
+- Train 3D GAN (Generator G, Discriminator D) on NORMAL patches only
+- Train an Encoder E (with G and D frozen) to map x -> z such that G(z) ≈ x
+- Anomaly score per patch = α * residual_loss(x, G(E(x)))
+  + (1-α) * feature_loss(D_feats(x), D_feats(G(E(x))))
+- Threshold set using ONLY normal validation scores (e.g., 95th percentile)
+- Evaluate on mixed test set with same metrics as ae_brats.py
+
+Outputs:
+- Models: best_gan_generator.pth, best_gan_discriminator.pth, best_encoder.pth
+- Plots: confusion matrix, ROC, PR, error histogram, latent visualization
+- Report: gan_brats_results/evaluation_results.txt
+"""
+
+import os
+import sys
+import glob
+import argparse
+import random
+import warnings
+import time
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
+
+import numpy as np
+import nibabel as nib
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm import tqdm
+import pandas as pd
+import plotly.figure_factory as ff
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+
+from sklearn.metrics import (
+    roc_auc_score, average_precision_score, accuracy_score,
+    precision_score, recall_score, f1_score, confusion_matrix,
+    roc_curve, precision_recall_curve, auc as sk_auc
+)
+from sklearn.manifold import TSNE
+from sklearn.decomposition import PCA
+
+warnings.filterwarnings('ignore')
+
+np.random.seed(42)
+torch.manual_seed(42)
+random.seed(42)
+
+try:
+    from scipy.linalg import sqrtm  # for FID computation
+    _HAS_SCIPY = True
+except Exception:
+    _HAS_SCIPY = False
+
+
+class Config:
+    """Configuration shared with ae_brats-style preprocessing and evaluation."""
+
+    def __init__(self):
+        # Dataset
+        self.dataset_path = "datasets/BraTS2025-GLI-PRE-Challenge-TrainingData"
+        self.output_dir = "gan_brats_results"
+
+        # Patch extraction
+        self.patch_size = 32
+        self.patches_per_volume = 50
+        self.min_non_zero_ratio = 0.2
+        self.max_normal_to_anomaly_ratio = 3
+        self.min_tumor_ratio_in_patch = 0.05
+
+        # Patch quality
+        self.min_patch_std = 0.01
+        self.min_patch_mean = 0.05
+        self.max_tumor_ratio_normal = 0.01
+        self.min_tumor_ratio_anomaly = 0.05
+        self.max_normal_patches_per_subject = 100
+        self.max_anomaly_patches_per_subject = 50
+
+        # Segmentation labels
+        self.anomaly_labels = [1, 2, 4]
+
+        # Brain tissue quality
+        self.min_brain_tissue_ratio = 0.3
+        self.max_background_intensity = 0.1
+        self.min_brain_mean_intensity = 0.1
+        self.max_high_intensity_ratio = 0.7
+        self.high_intensity_threshold = 0.9
+        self.edge_margin = 8
+
+        # GAN/Encoder model params
+        self.latent_dim = 128
+        self.g_learning_rate = 2e-4
+        self.d_learning_rate = 2e-4
+        self.e_learning_rate = 1e-4
+        self.beta1 = 0.5
+        self.beta2 = 0.999
+
+        self.batch_size = 8
+        self.gan_epochs = 80
+        self.encoder_epochs = 40
+        self.num_workers = 4 if torch.cuda.is_available() else 0
+
+        # Anomaly score blend
+        self.alpha_residual = 0.9  # residual weight; (1-alpha) for feature loss
+
+        # Device
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Visualization
+        self.slice_axis = 'axial'
+
+        # Verbosity
+        self.verbose = False
+
+        os.makedirs(self.output_dir, exist_ok=True)
+
+
+class BraTSPatchDataset(Dataset):
+    def __init__(self, patches: np.ndarray, labels: np.ndarray, transform=None):
+        self.patches = patches
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.patches)
+
+    def __getitem__(self, idx):
+        patch = self.patches[idx]
+        label = self.labels[idx]
+        patch = torch.FloatTensor(patch).unsqueeze(0)
+        label = torch.FloatTensor([label])
+        if self.transform:
+            patch = self.transform(patch)
+        return patch, label
+
+
+class BraTSDataProcessor:
+    def __init__(self, config: Config):
+        self.config = config
+
+    def load_volume(self, subject_path: str, modality: str = 't1c') -> Tuple[np.ndarray, np.ndarray]:
+        volume_file = glob.glob(os.path.join(subject_path, f"*-{modality}.nii.gz"))[0]
+        seg_file = glob.glob(os.path.join(subject_path, "*-seg.nii.gz"))[0]
+        volume = nib.load(volume_file).get_fdata()
+        segmentation = nib.load(seg_file).get_fdata()
+        return volume, segmentation
+
+    def is_brain_tissue_patch(self, patch: np.ndarray) -> bool:
+        brain_tissue_mask = patch > self.config.max_background_intensity
+        brain_tissue_ratio = np.sum(brain_tissue_mask) / patch.size
+        if brain_tissue_ratio < self.config.min_brain_tissue_ratio:
+            return False
+        brain_tissue_values = patch[brain_tissue_mask]
+        if len(brain_tissue_values) == 0:
+            return False
+        mean_brain_intensity = np.mean(brain_tissue_values)
+        if mean_brain_intensity < self.config.min_brain_mean_intensity:
+            return False
+        high_intensity_mask = patch > self.config.high_intensity_threshold
+        high_intensity_ratio = np.sum(high_intensity_mask) / patch.size
+        if high_intensity_ratio > self.config.max_high_intensity_ratio:
+            return False
+        if patch.std() < self.config.min_patch_std * 2:
+            return False
+        reasonable_intensity_mask = (patch > 0.05) & (patch < 0.95)
+        reasonable_ratio = np.sum(reasonable_intensity_mask) / patch.size
+        if reasonable_ratio < 0.5:
+            return False
+        return True
+
+    def get_anomaly_ratio_in_patch(self, segmentation_patch: np.ndarray) -> float:
+        anomaly_mask = np.isin(segmentation_patch, self.config.anomaly_labels)
+        return np.sum(anomaly_mask) / segmentation_patch.size
+
+    def normalize_volume(self, volume: np.ndarray) -> np.ndarray:
+        volume = volume.astype(np.float32)
+        non_zero_mask = volume > 0
+        if np.sum(non_zero_mask) == 0:
+            return volume
+        non_zero_values = volume[non_zero_mask]
+        p1 = np.percentile(non_zero_values, 1)
+        p99 = np.percentile(non_zero_values, 99)
+        volume = np.clip(volume, p1, p99)
+        volume[non_zero_mask] = (volume[non_zero_mask] - p1) / (p99 - p1)
+        volume = np.clip(volume, 0, 1)
+        return volume
+
+    def extract_normal_patches(self, volume: np.ndarray, segmentation: np.ndarray) -> List[np.ndarray]:
+        patches = []
+        brain_mask = (volume > self.config.max_background_intensity) & (volume < 0.95)
+        anomaly_mask = np.isin(segmentation, self.config.anomaly_labels)
+        normal_tissue_coords = np.where(~anomaly_mask)
+        brain_coords = np.where(brain_mask)
+        normal_set = set(zip(normal_tissue_coords[0], normal_tissue_coords[1], normal_tissue_coords[2]))
+        brain_set = set(zip(brain_coords[0], brain_coords[1], brain_coords[2]))
+        valid_coords_set = normal_set.intersection(brain_set)
+        if len(valid_coords_set) == 0:
+            return patches
+        valid_coords_list = list(valid_coords_set)
+        edge_margin = self.config.edge_margin
+        filtered_coords = []
+        for x, y, z in valid_coords_list:
+            if (x >= edge_margin and x < volume.shape[0] - edge_margin and
+                y >= edge_margin and y < volume.shape[1] - edge_margin and
+                z >= edge_margin and z < volume.shape[2] - edge_margin):
+                x_start = x - self.config.patch_size // 2
+                x_end = x_start + self.config.patch_size
+                y_start = y - self.config.patch_size // 2
+                y_end = y_start + self.config.patch_size
+                z_start = z - self.config.patch_size // 2
+                z_end = z_start + self.config.patch_size
+                if (x_start >= 0 and x_end <= volume.shape[0] and
+                    y_start >= 0 and y_end <= volume.shape[1] and
+                    z_start >= 0 and z_end <= volume.shape[2]):
+                    filtered_coords.append((x, y, z))
+        if len(filtered_coords) == 0:
+            if self.config.verbose:
+                print("Warning: No valid coordinates found for normal patch extraction")
+            return patches
+        max_patches = min(len(filtered_coords) // 20, self.config.max_normal_patches_per_subject)
+        max_patches = max(max_patches, 10)
+        num_to_sample = min(max_patches * 5, len(filtered_coords))
+        indices = np.random.choice(len(filtered_coords), size=num_to_sample, replace=False)
+        patch_coords = [filtered_coords[i] for i in indices]
+        patches_extracted = 0
+        for x, y, z in tqdm(patch_coords, desc="Extracting normal patches", leave=False):
+            x_start = x - self.config.patch_size // 2
+            x_end = x_start + self.config.patch_size
+            y_start = y - self.config.patch_size // 2
+            y_end = y_start + self.config.patch_size
+            z_start = z - self.config.patch_size // 2
+            z_end = z_start + self.config.patch_size
+            patch = volume[x_start:x_end, y_start:y_end, z_start:z_end]
+            patch_seg = segmentation[x_start:x_end, y_start:y_end, z_start:z_end]
+            anomaly_ratio = self.get_anomaly_ratio_in_patch(patch_seg)
+            if anomaly_ratio > self.config.max_tumor_ratio_normal:
+                continue
+            if not self.is_brain_tissue_patch(patch):
+                continue
+            if patch.std() < self.config.min_patch_std:
+                continue
+            patches.append(patch)
+            patches_extracted += 1
+            if patches_extracted >= max_patches:
+                break
+        return patches
+
+    def extract_anomalous_patches(self, volume: np.ndarray, segmentation: np.ndarray) -> List[np.ndarray]:
+        patches = []
+        anomaly_mask = np.isin(segmentation, self.config.anomaly_labels)
+        anomaly_coords = np.where(anomaly_mask)
+        if len(anomaly_coords[0]) == 0:
+            return patches
+        max_patches = min(len(anomaly_coords[0]) // 50, self.config.max_anomaly_patches_per_subject)
+        if max_patches == 0:
+            return patches
+        indices = np.random.choice(len(anomaly_coords[0]), size=min(max_patches, len(anomaly_coords[0])), replace=False)
+        patch_coords = [(anomaly_coords[0][i], anomaly_coords[1][i], anomaly_coords[2][i]) for i in indices]
+        for x, y, z in tqdm(patch_coords, desc="Extracting anomaly patches", leave=False):
+            x_start = max(0, x - self.config.patch_size // 2)
+            x_end = min(volume.shape[0], x_start + self.config.patch_size)
+            y_start = max(0, y - self.config.patch_size // 2)
+            y_end = min(volume.shape[1], y_start + self.config.patch_size)
+            z_start = max(0, z - self.config.patch_size // 2)
+            z_end = min(volume.shape[2], z_start + self.config.patch_size)
+            if x_end - x_start < self.config.patch_size:
+                x_start = max(0, x_end - self.config.patch_size)
+            if y_end - y_start < self.config.patch_size:
+                y_start = max(0, y_end - self.config.patch_size)
+            if z_end - z_start < self.config.patch_size:
+                z_start = max(0, z_end - self.config.patch_size)
+            if (x_end - x_start != self.config.patch_size or
+                y_end - y_start != self.config.patch_size or
+                z_end - z_start != self.config.patch_size):
+                continue
+            patch = volume[x_start:x_end, y_start:y_end, z_start:z_end]
+            if patch.std() > self.config.min_patch_std and patch.mean() > self.config.min_patch_mean:
+                patch_seg = segmentation[x_start:x_end, y_start:y_end, z_start:z_end]
+                anomaly_ratio = self.get_anomaly_ratio_in_patch(patch_seg)
+                if anomaly_ratio >= self.config.min_tumor_ratio_anomaly:
+                    patches.append(patch)
+        return patches
+
+    def process_dataset(self, num_subjects: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        subject_dirs = [d for d in os.listdir(self.config.dataset_path)
+                        if os.path.isdir(os.path.join(self.config.dataset_path, d))]
+        if num_subjects:
+            subject_dirs = subject_dirs[:num_subjects]
+        all_normal_patches, all_anomalous_patches = [], []
+        all_normal_subjects, all_anomalous_subjects = [], []
+        for subject_dir in tqdm(subject_dirs, desc="Processing subjects"):
+            subject_path = os.path.join(self.config.dataset_path, subject_dir)
+            try:
+                volume, segmentation = self.load_volume(subject_path)
+                volume = self.normalize_volume(volume)
+                normal_patches = self.extract_normal_patches(volume, segmentation)
+                anomalous_patches = self.extract_anomalous_patches(volume, segmentation)
+                all_normal_patches.extend(normal_patches)
+                all_normal_subjects.extend([subject_dir] * len(normal_patches))
+                all_anomalous_patches.extend(anomalous_patches)
+                all_anomalous_subjects.extend([subject_dir] * len(anomalous_patches))
+            except Exception:
+                continue
+        num_anomalous = len(all_anomalous_patches)
+        max_normal = int(num_anomalous * self.config.max_normal_to_anomaly_ratio)
+        if len(all_normal_patches) > max_normal and max_normal > 0:
+            idx = np.random.choice(len(all_normal_patches), max_normal, replace=False)
+            all_normal_patches = [all_normal_patches[i] for i in idx]
+            all_normal_subjects = [all_normal_subjects[i] for i in idx]
+        all_patches = all_normal_patches + all_anomalous_patches
+        labels = [0] * len(all_normal_patches) + [1] * len(all_anomalous_patches)
+        subjects = all_normal_subjects + all_anomalous_subjects
+        patches_array = np.array(all_patches, dtype=np.float32)
+        labels_array = np.array(labels, dtype=np.int64)
+        return patches_array, labels_array, subjects
+
+
+class Generator3D(nn.Module):
+    def __init__(self, latent_dim: int = 128):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.fc = nn.Sequential(
+            nn.Linear(latent_dim, 256 * 4 * 4 * 4),
+            nn.ReLU(inplace=True)
+        )
+        self.unflatten = nn.Unflatten(1, (256, 4, 4, 4))
+        self.net = nn.Sequential(
+            nn.ConvTranspose3d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(128),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose3d(128, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(64),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose3d(64, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(32, 1, kernel_size=3, stride=1, padding=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        x = self.fc(z)
+        x = self.unflatten(x)
+        x = self.net(x)
+        return x
+
+
+class Discriminator3D(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv3d(1, 32, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(256),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.flatten = nn.Flatten()
+        self.classifier = nn.Linear(256 * 2 * 2 * 2, 1)
+
+    def forward(self, x: torch.Tensor, return_features: bool = False):
+        feats = self.features(x)
+        logits = self.classifier(self.flatten(feats))
+        if return_features:
+            return logits, feats
+        return logits
+
+
+class Encoder3D(nn.Module):
+    def __init__(self, latent_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv3d(1, 32, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(32),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(32, 64, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(64),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(64, 128, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(128),
+            nn.LeakyReLU(0.2, inplace=True),
+            nn.Conv3d(128, 256, kernel_size=4, stride=2, padding=1),
+            nn.BatchNorm3d(256),
+            nn.LeakyReLU(0.2, inplace=True)
+        )
+        self.flatten = nn.Flatten()
+        self.fc = nn.Linear(256 * 2 * 2 * 2, latent_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.net(x)
+        z = self.fc(self.flatten(h))
+        return z
+
+
+class GenerativeAnomalyDetector:
+    def __init__(self, config: Config):
+        self.config = config
+        self.device = config.device
+        self.G = Generator3D(config.latent_dim).to(self.device)
+        self.D = Discriminator3D().to(self.device)
+        self.E = Encoder3D(config.latent_dim).to(self.device)
+
+    def train_gan(self, train_loader: DataLoader):
+        criterion = nn.BCEWithLogitsLoss()
+        optimizerD = optim.Adam(self.D.parameters(), lr=self.config.d_learning_rate, betas=(self.config.beta1, self.config.beta2))
+        optimizerG = optim.Adam(self.G.parameters(), lr=self.config.g_learning_rate, betas=(self.config.beta1, self.config.beta2))
+        scaler = GradScaler()
+        self.G.train()
+        self.D.train()
+        fixed_noise = torch.randn(self.config.batch_size, self.config.latent_dim, device=self.device)
+        total_steps = self.config.gan_epochs * max(1, len(train_loader))
+        with tqdm(total=total_steps, desc="GAN Training") as pbar:
+            for epoch in range(self.config.gan_epochs):
+                for real, _ in train_loader:
+                    real = real.to(self.device)
+                    bsz = real.size(0)
+                    valid = torch.ones((bsz, 1), device=self.device)
+                    fake = torch.zeros((bsz, 1), device=self.device)
+
+                    # Train Discriminator
+                    optimizerD.zero_grad(set_to_none=True)
+                    z = torch.randn(bsz, self.config.latent_dim, device=self.device)
+                    with autocast():
+                        fake_imgs = self.G(z).detach()
+                        real_logits = self.D(real)
+                        fake_logits = self.D(fake_imgs)
+                        d_real_loss = criterion(real_logits, valid)
+                        d_fake_loss = criterion(fake_logits, fake)
+                        d_loss = (d_real_loss + d_fake_loss) / 2
+                    scaler.scale(d_loss).backward()
+                    scaler.step(optimizerD)
+
+                    # Train Generator
+                    optimizerG.zero_grad(set_to_none=True)
+                    z = torch.randn(bsz, self.config.latent_dim, device=self.device)
+                    with autocast():
+                        gen_imgs = self.G(z)
+                        gen_logits = self.D(gen_imgs)
+                        g_loss = criterion(gen_logits, valid)
+                    scaler.scale(g_loss).backward()
+                    scaler.step(optimizerG)
+                    scaler.update()
+
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'epoch': f"{epoch+1}/{self.config.gan_epochs}",
+                        'd_loss': f"{d_loss.item():.4f}",
+                        'g_loss': f"{g_loss.item():.4f}"
+                    })
+
+        # Save final GAN weights
+        torch.save(self.G.state_dict(), os.path.join(self.config.output_dir, 'best_gan_generator.pth'))
+        torch.save(self.D.state_dict(), os.path.join(self.config.output_dir, 'best_gan_discriminator.pth'))
+
+    def train_encoder(self, train_loader: DataLoader):
+        # Freeze G and D, train E to reconstruct x via G(E(x)) and match D features
+        for p in self.G.parameters():
+            p.requires_grad = False
+        for p in self.D.parameters():
+            p.requires_grad = False
+        self.G.eval()
+        self.D.eval()
+        self.E.train()
+
+        optimizerE = optim.Adam(self.E.parameters(), lr=self.config.e_learning_rate, betas=(self.config.beta1, self.config.beta2))
+        scaler = GradScaler()
+        total_steps = self.config.encoder_epochs * max(1, len(train_loader))
+        alpha = self.config.alpha_residual
+
+        with tqdm(total=total_steps, desc="Encoder Training") as pbar:
+            for epoch in range(self.config.encoder_epochs):
+                for real, _ in train_loader:
+                    real = real.to(self.device)
+                    optimizerE.zero_grad(set_to_none=True)
+                    with autocast():
+                        z = self.E(real)
+                        recon = self.G(z)
+                        # Residual loss (MSE over voxels)
+                        residual = torch.mean((real - recon) ** 2, dim=(1, 2, 3, 4))
+                        residual_loss = residual.mean()
+                        # Feature matching loss on discriminator feature maps
+                        _, feats_real = self.D(real, return_features=True)
+                        _, feats_fake = self.D(recon, return_features=True)
+                        feat_loss = F.l1_loss(feats_fake, feats_real)
+                        loss = alpha * residual_loss + (1 - alpha) * feat_loss
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizerE)
+                    scaler.update()
+                    pbar.update(1)
+                    pbar.set_postfix({
+                        'epoch': f"{epoch+1}/{self.config.encoder_epochs}",
+                        'enc_loss': f"{loss.item():.4f}",
+                        'res': f"{residual_loss.item():.4f}",
+                        'feat': f"{feat_loss.item():.4f}"
+                    })
+
+        torch.save(self.E.state_dict(), os.path.join(self.config.output_dir, 'best_encoder.pth'))
+
+    @torch.no_grad()
+    def compute_anomaly_scores(self, data_loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
+        self.G.eval(); self.D.eval(); self.E.eval()
+        alpha = self.config.alpha_residual
+        scores, labels = [], []
+        for real, y in tqdm(data_loader, desc="Scoring"):
+            real = real.to(self.device)
+            z = self.E(real)
+            recon = self.G(z)
+            residual = torch.mean((real - recon) ** 2, dim=(1, 2, 3, 4))
+            _, feats_real = self.D(real, return_features=True)
+            _, feats_fake = self.D(recon, return_features=True)
+            feat = torch.mean(torch.abs(feats_real - feats_fake), dim=(1, 2, 3, 4))
+            score = alpha * residual + (1 - alpha) * feat
+            scores.extend(score.detach().cpu().numpy())
+            labels.extend(y.cpu().numpy().flatten())
+        return np.array(scores), np.array(labels)
+
+    def find_unsupervised_threshold(self, val_loader: DataLoader) -> float:
+        if self.config.verbose:
+            print("\nUNSUPERVISED THRESHOLD from normal validation scores (95th percentile)")
+        scores, labels = self.compute_anomaly_scores(val_loader)
+        normal_scores = scores[labels == 0]
+        if len(normal_scores) == 0:
+            return float(np.percentile(scores, 95)) if len(scores) else 0.0
+        thr = float(np.percentile(normal_scores, 95))
+        if self.config.verbose:
+            print(f"Normal val scores: mean={normal_scores.mean():.6f}, std={normal_scores.std():.6f}, thr={thr:.6f}")
+        return thr
+
+    def evaluate(self, test_loader: DataLoader, val_loader: DataLoader) -> Dict:
+        # Load checkpoints if present
+        g_path = os.path.join(self.config.output_dir, 'best_gan_generator.pth')
+        d_path = os.path.join(self.config.output_dir, 'best_gan_discriminator.pth')
+        e_path = os.path.join(self.config.output_dir, 'best_encoder.pth')
+        if os.path.exists(g_path):
+            self.G.load_state_dict(torch.load(g_path, map_location=self.device))
+        if os.path.exists(d_path):
+            self.D.load_state_dict(torch.load(d_path, map_location=self.device))
+        if os.path.exists(e_path):
+            self.E.load_state_dict(torch.load(e_path, map_location=self.device))
+
+        optimal_threshold = self.find_unsupervised_threshold(val_loader)
+        scores, true_labels = self.compute_anomaly_scores(test_loader)
+
+        # Collect latent features (encoder embeddings) for qualitative visualization
+        latent_features, _ = self.compute_latent_features(test_loader)
+
+        # Collect qualitative examples (limited) of reconstructions and feature residuals
+        examples = self.sample_reconstruction_examples(test_loader, max_normal=10, max_anomaly=10)
+
+        # Compute GAN quality metrics (feature-space FID/KID, precision/recall) on validation normals
+        gen_quality = self.compute_generative_quality_metrics(val_loader, max_real_samples=512, num_gen_samples=512)
+        preds = (scores > optimal_threshold).astype(int)
+
+        try:
+            roc_auc = roc_auc_score(true_labels, scores)
+            average_precision = average_precision_score(true_labels, scores)
+        except Exception:
+            roc_auc, average_precision = 0.0, 0.0
+        accuracy = accuracy_score(true_labels, preds)
+        precision = precision_score(true_labels, preds, zero_division=0)
+        recall = recall_score(true_labels, preds, zero_division=0)
+        f1 = f1_score(true_labels, preds, zero_division=0)
+        tn, fp, fn, tp = confusion_matrix(true_labels, preds).ravel()
+        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+        balanced_accuracy = (sensitivity + specificity) / 2
+        mcc = ((tp * tn) - (fp * fn)) / np.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) if ((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)) > 0 else 0
+        dsc = (2 * tp) / (2 * tp + fp + fn) if (2 * tp + fp + fn) > 0 else 0
+        fpr = fp / (fp + tn) if (fp + tn) > 0 else 0
+        fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
+
+        results = {
+            'anomaly_scores': scores,
+            'true_labels': true_labels,
+            'predictions': preds,
+            'latent_features': latent_features,
+            'optimal_threshold': optimal_threshold,
+            # Qualitative examples
+            'sample_real': examples.get('real'),
+            'sample_recon': examples.get('recon'),
+            'sample_residual': examples.get('residual'),
+            'sample_feat_residual': examples.get('feat_residual'),
+            'sample_labels': examples.get('labels'),
+            # GAN quality metrics (feature space)
+            'fid_d': gen_quality.get('fid_d'),
+            'kid_d': gen_quality.get('kid_d'),
+            'gen_precision': gen_quality.get('precision'),
+            'gen_recall': gen_quality.get('recall'),
+            'roc_auc': roc_auc,
+            'average_precision': average_precision,
+            'mcc': mcc,
+            'dsc': dsc,
+            'balanced_accuracy': balanced_accuracy,
+            'accuracy': accuracy,
+            'precision': precision,
+            'recall': recall,
+            'f1_score': f1,
+            'sensitivity': sensitivity,
+            'specificity': specificity,
+            'fpr': fpr,
+            'fnr': fnr,
+            'confusion_matrix': {'tn': tn, 'fp': fp, 'fn': fn, 'tp': tp}
+        }
+        return results
+
+    @torch.no_grad()
+    def compute_latent_features(self, data_loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
+        self.E.eval()
+        latents, labels = [], []
+        for real, y in tqdm(data_loader, desc="Latent features"):
+            real = real.to(self.device)
+            z = self.E(real)
+            latents.append(z.detach().cpu().numpy())
+            labels.extend(y.cpu().numpy().flatten())
+        if len(latents) > 0:
+            latents = np.concatenate(latents, axis=0)
+        else:
+            latents = np.zeros((0, self.config.latent_dim), dtype=np.float32)
+        return latents, np.array(labels)
+
+    @torch.no_grad()
+    def sample_reconstruction_examples(self, data_loader: DataLoader, max_normal: int = 10, max_anomaly: int = 10) -> Dict[str, np.ndarray]:
+        self.G.eval(); self.D.eval(); self.E.eval()
+        real_list, recon_list, res_list, feat_res_list, labels_list = [], [], [], [], []
+        n_norm, n_anom = 0, 0
+        for real, y in data_loader:
+            real = real.to(self.device)
+            y_np = y.cpu().numpy().flatten()
+            z = self.E(real)
+            recon = self.G(z)
+            residual = torch.abs(real - recon)
+            # Feature residuals: D feature maps L1 diff, upsample to input size for visualization
+            _, feats_real = self.D(real, return_features=True)
+            _, feats_fake = self.D(recon, return_features=True)
+            feat_res = torch.mean(torch.abs(feats_real - feats_fake), dim=1, keepdim=True)  # [B,1,d1,d2,d3]
+            feat_res_up = F.interpolate(feat_res, size=real.shape[2:], mode='trilinear', align_corners=False)
+
+            for i in range(real.size(0)):
+                label = int(y_np[i])
+                if label == 0 and n_norm < max_normal:
+                    real_list.append(real[i:i+1].cpu().numpy())
+                    recon_list.append(recon[i:i+1].cpu().numpy())
+                    res_list.append(residual[i:i+1].cpu().numpy())
+                    feat_res_list.append(feat_res_up[i:i+1].cpu().numpy())
+                    labels_list.append(label)
+                    n_norm += 1
+                elif label == 1 and n_anom < max_anomaly:
+                    real_list.append(real[i:i+1].cpu().numpy())
+                    recon_list.append(recon[i:i+1].cpu().numpy())
+                    res_list.append(residual[i:i+1].cpu().numpy())
+                    feat_res_list.append(feat_res_up[i:i+1].cpu().numpy())
+                    labels_list.append(label)
+                    n_anom += 1
+                if n_norm >= max_normal and n_anom >= max_anomaly:
+                    break
+            if n_norm >= max_normal and n_anom >= max_anomaly:
+                break
+        if len(real_list) == 0:
+            return {'real': None, 'recon': None, 'residual': None, 'feat_residual': None, 'labels': None}
+        real_arr = np.concatenate(real_list, axis=0)
+        recon_arr = np.concatenate(recon_list, axis=0)
+        res_arr = np.concatenate(res_list, axis=0)
+        feat_res_arr = np.concatenate(feat_res_list, axis=0)
+        labels_arr = np.array(labels_list)
+        return {'real': real_arr, 'recon': recon_arr, 'residual': res_arr, 'feat_residual': feat_res_arr, 'labels': labels_arr}
+
+    @torch.no_grad()
+    def compute_generative_quality_metrics(self, val_loader: DataLoader, max_real_samples: int = 512, num_gen_samples: int = 512, k: int = 3) -> Dict[str, float]:
+        # Collect real normal patches from validation
+        self.D.eval(); self.G.eval()
+        real_feats = []
+        collected = 0
+        for real, labels in val_loader:
+            mask = (labels.squeeze() == 0)
+            if mask.sum() == 0:
+                continue
+            real_norm = real[mask].to(self.device)
+            _, feats = self.D(real_norm, return_features=True)
+            feats = feats.detach().cpu().numpy()
+            feats = feats.reshape(feats.shape[0], -1)
+            real_feats.append(feats)
+            collected += feats.shape[0]
+            if collected >= max_real_samples:
+                break
+        if len(real_feats) == 0:
+            return {'fid_d': np.nan, 'kid_d': np.nan, 'precision': np.nan, 'recall': np.nan}
+        real_feats = np.concatenate(real_feats, axis=0)
+        n_real = real_feats.shape[0]
+        # Generate samples
+        gen_feats = []
+        remaining = min(num_gen_samples, n_real)
+        while remaining > 0:
+            b = min(remaining, 64)
+            z = torch.randn(b, self.config.latent_dim, device=self.device)
+            fake = self.G(z)
+            _, feats = self.D(fake, return_features=True)
+            feats = feats.detach().cpu().numpy().reshape(b, -1)
+            gen_feats.append(feats)
+            remaining -= b
+        gen_feats = np.concatenate(gen_feats, axis=0)
+
+        # FID in D-feature space
+        fid_val = self._compute_fid_from_features(real_feats, gen_feats)
+        # KID (MMD^2 with polynomial kernel) in D-feature space
+        kid_val = self._compute_kid_from_features(real_feats, gen_feats)
+        # Precision/Recall (Kynkäänniemi-style) in D-feature space
+        prec, rec = self._compute_precision_recall(real_feats, gen_feats, k=k)
+        return {'fid_d': float(fid_val) if fid_val is not None else np.nan,
+                'kid_d': float(kid_val),
+                'precision': float(prec),
+                'recall': float(rec)}
+
+    def _compute_fid_from_features(self, real: np.ndarray, gen: np.ndarray) -> Optional[float]:
+        if not _HAS_SCIPY:
+            if self.config.verbose:
+                print("Warning: scipy not available; skipping FID.")
+            return None
+        mu_r = np.mean(real, axis=0)
+        mu_g = np.mean(gen, axis=0)
+        sigma_r = np.cov(real, rowvar=False)
+        sigma_g = np.cov(gen, rowvar=False)
+        covmean = sqrtm(sigma_r.dot(sigma_g))
+        if np.iscomplexobj(covmean):
+            covmean = covmean.real
+        fid = np.sum((mu_r - mu_g) ** 2) + np.trace(sigma_r + sigma_g - 2 * covmean)
+        return float(fid)
+
+    def _compute_kid_from_features(self, real: np.ndarray, gen: np.ndarray, degree: int = 3, gamma: Optional[float] = None, coef0: float = 1.0) -> float:
+        # Polynomial kernel: k(x,y) = (gamma * x^T y + coef0)^degree
+        if gamma is None:
+            gamma = 1.0 / real.shape[1]
+        def poly_kernel(x, y):
+            return (gamma * np.dot(x, y.T) + coef0) ** degree
+        k_rr = poly_kernel(real, real)
+        k_gg = poly_kernel(gen, gen)
+        k_rg = poly_kernel(real, gen)
+        n = real.shape[0]
+        m = gen.shape[0]
+        # Unbiased MMD^2 estimator
+        np.fill_diagonal(k_rr, 0)
+        np.fill_diagonal(k_gg, 0)
+        mmd2 = (k_rr.sum() / (n * (n - 1))) + (k_gg.sum() / (m * (m - 1))) - (2 * k_rg.mean())
+        return float(mmd2)
+
+    def _compute_precision_recall(self, real: np.ndarray, gen: np.ndarray, k: int = 3) -> Tuple[float, float]:
+        # Compute radii from kNN among real and gen, then coverage-based precision/recall
+        # Distances
+        def pairwise_dist(a, b):
+            # (n,d) x (m,d) -> (n,m)
+            a2 = np.sum(a * a, axis=1, keepdims=True)
+            b2 = np.sum(b * b, axis=1, keepdims=True).T
+            return np.clip(a2 + b2 - 2 * np.dot(a, b.T), a_min=0, a_max=None)
+        d_rr = pairwise_dist(real, real)
+        d_gg = pairwise_dist(gen, gen)
+        d_rg = pairwise_dist(real, gen)
+        d_gr = d_rg.T
+        # Radii: k-th neighbor (skip self at index 0)
+        r_real = np.sqrt(np.sort(d_rr, axis=1)[:, k])
+        r_gen = np.sqrt(np.sort(d_gg, axis=1)[:, k])
+        # Precision: fraction of gen inside at least one real-ball
+        inside = (np.sqrt(d_gr) <= r_real[None, :])  # (Ng, Nr)
+        precision = float(np.mean(inside.any(axis=1)))
+        # Recall: fraction of real inside at least one gen-ball
+        inside_r = (np.sqrt(d_rg) <= r_gen[None, :])  # (Nr, Ng)
+        recall = float(np.mean(inside_r.any(axis=1)))
+        return precision, recall
+
+
+class Visualizer:
+    def __init__(self, config: Config):
+        self.config = config
+
+    def plot_confusion_matrix(self, true_labels: np.ndarray, predictions: np.ndarray):
+        cm = confusion_matrix(true_labels, predictions)
+        if cm.shape != (2, 2):
+            if self.config.verbose:
+                print("WARNING: Confusion matrix is not 2x2. Skipping plot.")
+            return
+        tn, fp, fn, tp = cm.ravel()
+        z = [[tn, fp], [fn, tp]]
+        x = ['Normal (0)', 'Anomaly (1)']
+        y = ['Normal (0)', 'Anomaly (1)']
+        row_sums = cm.sum(axis=1)
+        z_text = [
+            [f"{tn}<br>({tn/row_sums[0]*100:.1f}%)" if row_sums[0] > 0 else str(tn),
+             f"{fp}<br>({fp/row_sums[0]*100:.1f}%)" if row_sums[0] > 0 else str(fp)],
+            [f"{fn}<br>({fn/row_sums[1]*100:.1f}%)" if row_sums[1] > 0 else str(fn),
+             f"{tp}<br>({tp/row_sums[1]*100:.1f}%)" if row_sums[1] > 0 else str(tp)]
+        ]
+        fig = ff.create_annotated_heatmap(z, x=x, y=y, annotation_text=z_text, colorscale='Blues', font_colors=['black', 'white'])
+        fig.update_layout(
+            title_text='<b>Confusion Matrix</b><br>(Count and Percentage)',
+            title_x=0.5,
+            xaxis=dict(title='<b>Predicted Label</b>'),
+            yaxis=dict(title='<b>True Label</b>', autorange='reversed'),
+            font=dict(size=14)
+        )
+        fig.update_xaxes(side="bottom")
+        output_path = os.path.join(self.config.output_dir, 'confusion_matrix.png')
+        try:
+            fig.write_image(output_path, width=800, height=800, scale=2)
+        except ValueError as e:
+            print(f"ERROR: Could not save confusion matrix plot: {e}")
+            print("Please make sure you have 'plotly' and 'kaleido' installed (`pip install plotly kaleido`).")
+
+    def plot_roc_curve(self, true_labels: np.ndarray, scores: np.ndarray):
+        fpr, tpr, _ = roc_curve(true_labels, scores)
+        auc = roc_auc_score(true_labels, scores)
+        plt.figure(figsize=(8, 6))
+        plt.plot(fpr, tpr, color="#1f77b4", lw=2, label=f"ROC (AUC = {auc:.2f})")
+        plt.fill_between(fpr, tpr, step="pre", alpha=0.25, color="#aec7e8")
+        plt.plot([0, 1], [0, 1], linestyle="--", color="#888888", lw=1, label="Chance")
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('FPR')
+        plt.ylabel('TPR')
+        plt.title('ROC Curve')
+        plt.legend(loc='lower right')
+        plt.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+        plt.savefig(os.path.join(self.config.output_dir, 'roc_curve.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def plot_precision_recall_curve(self, true_labels: np.ndarray, scores: np.ndarray):
+        precision, recall, _ = precision_recall_curve(true_labels, scores)
+        pr_auc_value = sk_auc(recall, precision)
+        plt.figure(figsize=(8, 6))
+        plt.plot(recall, precision, color="#ff7f0e", lw=2, label=f"PR (AUC = {pr_auc_value:.2f})")
+        plt.fill_between(recall, precision, step="pre", alpha=0.25, color="#ffbb78")
+        plt.xlim([0.0, 1.0])
+        plt.ylim([0.0, 1.05])
+        plt.xlabel('Recall')
+        plt.ylabel('Precision')
+        plt.title('Precision-Recall Curve')
+        plt.legend(loc='lower left')
+        plt.grid(True, linestyle=":", linewidth=0.6, alpha=0.7)
+        plt.savefig(os.path.join(self.config.output_dir, 'precision_recall_curve.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def plot_score_histogram(self, scores: np.ndarray, true_labels: np.ndarray, optimal_threshold: float):
+        normal_scores = scores[true_labels == 0]
+        anomaly_scores = scores[true_labels == 1]
+        plt.figure(figsize=(12, 6))
+        plt.hist(normal_scores, bins=50, alpha=0.7, label='Normal', color='blue', density=True)
+        plt.hist(anomaly_scores, bins=50, alpha=0.7, label='Anomaly', color='red', density=True)
+        plt.axvline(optimal_threshold, color='black', linestyle='--', linewidth=2, label=f'Threshold = {optimal_threshold:.6f}')
+        plt.xlabel('Anomaly Score')
+        plt.ylabel('Density')
+        plt.title('Distribution of Anomaly Scores')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.savefig(os.path.join(self.config.output_dir, 'anomaly_score_histogram.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def create_summary_report(self, results: Dict):
+        self.plot_confusion_matrix(results['true_labels'], results['predictions'])
+        self.plot_roc_curve(results['true_labels'], results['anomaly_scores'])
+        self.plot_precision_recall_curve(results['true_labels'], results['anomaly_scores'])
+        self.plot_score_histogram(results['anomaly_scores'], results['true_labels'], results['optimal_threshold'])
+        # Latent space visualization (PCA + t-SNE) from encoder embeddings
+        if 'latent_features' in results and len(results['latent_features']) > 0:
+            self.plot_latent_space_visualization(results['latent_features'], results['true_labels'])
+        # Qualitative examples: residuals and feature residuals
+        if results.get('sample_real') is not None:
+            self.save_residual_examples(results['sample_real'], results['sample_recon'], results['sample_residual'], results['sample_labels'])
+            if results.get('sample_feat_residual') is not None:
+                self.save_feature_residual_examples(results['sample_real'], results['sample_recon'], results['sample_feat_residual'], results['sample_labels'])
+        # Also save a small grid of generated normals vs real normals
+        self.save_real_vs_generated_grid()
+        print(f"\nAll visualizations saved to: {self.config.output_dir}")
+
+    def plot_latent_space_visualization(self, latent_features: np.ndarray, true_labels: np.ndarray):
+        print("Creating latent space visualizations (PCA & t-SNE) from encoder embeddings...")
+        # Limit samples for visualization
+        if len(latent_features) > 2000:
+            idx = np.random.choice(len(latent_features), 2000, replace=False)
+            latent = latent_features[idx]
+            labels = true_labels[idx]
+        else:
+            latent = latent_features
+            labels = true_labels
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+        # PCA
+        pca = PCA(n_components=2)
+        pca_feat = pca.fit_transform(latent)
+        ax1.scatter(pca_feat[labels == 0, 0], pca_feat[labels == 0, 1], c='blue', alpha=0.6, label='Normal', s=20)
+        ax1.scatter(pca_feat[labels == 1, 0], pca_feat[labels == 1, 1], c='red', alpha=0.6, label='Anomaly', s=20)
+        ax1.set_xlabel(f'PC1 ({pca.explained_variance_ratio_[0]:.2%})')
+        ax1.set_ylabel(f'PC2 ({pca.explained_variance_ratio_[1]:.2%})')
+        ax1.set_title('PCA of Encoder Latent Features')
+        ax1.legend(); ax1.grid(True, alpha=0.3)
+
+        # t-SNE
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, max(5, len(latent)//4)))
+        tsne_feat = tsne.fit_transform(latent)
+        ax2.scatter(tsne_feat[labels == 0, 0], tsne_feat[labels == 0, 1], c='blue', alpha=0.6, label='Normal', s=20)
+        ax2.scatter(tsne_feat[labels == 1, 0], tsne_feat[labels == 1, 1], c='red', alpha=0.6, label='Anomaly', s=20)
+        ax2.set_xlabel('t-SNE 1'); ax2.set_ylabel('t-SNE 2')
+        ax2.set_title('t-SNE of Encoder Latent Features')
+        ax2.legend(); ax2.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.config.output_dir, 'latent_space_visualization.png'), dpi=300, bbox_inches='tight')
+        plt.close()
+
+    def _save_patch_triplet(self, ax_row, vol_real, vol_recon, vol_heat, title_heat: str, axis='axial'):
+        # choose 3 evenly spaced slices
+        if axis == 'axial':
+            axes = 2
+        elif axis == 'coronal':
+            axes = 1
+        else:
+            axes = 0
+        for j, frac in enumerate([0.35, 0.5, 0.65]):
+            s = max(0, min(vol_real.shape[axes]-1, int(vol_real.shape[axes] * frac)))
+            if axes == 2:
+                r_slice = vol_real[0, 0, :, :, s]
+                x_slice = vol_recon[0, 0, :, :, s]
+                h_slice = vol_heat[0, 0, :, :, s]
+            elif axes == 1:
+                r_slice = vol_real[0, 0, :, s, :]
+                x_slice = vol_recon[0, 0, :, s, :]
+                h_slice = vol_heat[0, 0, :, s, :]
+            else:
+                r_slice = vol_real[0, 0, s, :, :]
+                x_slice = vol_recon[0, 0, s, :, :]
+                h_slice = vol_heat[0, 0, s, :, :]
+            ax_row[0, j].imshow(r_slice, cmap='gray'); ax_row[0, j].set_title('Input'); ax_row[0, j].axis('off')
+            ax_row[1, j].imshow(x_slice, cmap='gray'); ax_row[1, j].set_title('Recon'); ax_row[1, j].axis('off')
+            im = ax_row[2, j].imshow(h_slice, cmap='inferno'); ax_row[2, j].set_title(title_heat); ax_row[2, j].axis('off')
+
+    def save_residual_examples(self, real: np.ndarray, recon: np.ndarray, residual: np.ndarray, labels: np.ndarray, axis: str = 'axial'):
+        out_dir = os.path.join(self.config.output_dir, 'qualitative_examples')
+        os.makedirs(out_dir, exist_ok=True)
+        for i in range(real.shape[0]):
+            fig, axes = plt.subplots(3, 3, figsize=(10, 10))
+            self._save_patch_triplet(axes, real[i:i+1], recon[i:i+1], residual[i:i+1], 'Residual', axis)
+            tag = 'normal' if labels[i] == 0 else 'anomaly'
+            fig.suptitle(f'{tag.capitalize()} example #{i+1}', fontsize=14)
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f'{tag}_residual_{i+1:03d}.png'), dpi=200, bbox_inches='tight')
+            plt.close()
+
+    def save_feature_residual_examples(self, real: np.ndarray, recon: np.ndarray, feat_residual: np.ndarray, labels: np.ndarray, axis: str = 'axial'):
+        out_dir = os.path.join(self.config.output_dir, 'qualitative_examples')
+        os.makedirs(out_dir, exist_ok=True)
+        for i in range(real.shape[0]):
+            fig, axes = plt.subplots(3, 3, figsize=(10, 10))
+            self._save_patch_triplet(axes, real[i:i+1], recon[i:i+1], feat_residual[i:i+1], 'Feat-Residual', axis)
+            tag = 'normal' if labels[i] == 0 else 'anomaly'
+            fig.suptitle(f'{tag.capitalize()} example (feature) #{i+1}', fontsize=14)
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f'{tag}_feat_residual_{i+1:03d}.png'), dpi=200, bbox_inches='tight')
+            plt.close()
+
+    def save_real_vs_generated_grid(self, n: int = 16):
+        # placeholder: we visualize generated normals alone to inspect realism
+        # Since Visualizer doesn't have the model, we just note the slot; actual generation is done during evaluation metrics and not persisted.
+        pass
+
+
+def main():
+    start_time = time.time()
+    parser = argparse.ArgumentParser(description='3D Generative (f-AnoGAN) Anomaly Detection for BraTS')
+    parser.add_argument('--num_subjects', type=int, default=None)
+    parser.add_argument('--patch_size', type=int, default=32)
+    parser.add_argument('--patches_per_volume', type=int, default=50)
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--latent_dim', type=int, default=128)
+    parser.add_argument('--g_lr', type=float, default=2e-4)
+    parser.add_argument('--d_lr', type=float, default=2e-4)
+    parser.add_argument('--e_lr', type=float, default=1e-4)
+    parser.add_argument('--gan_epochs', type=int, default=80)
+    parser.add_argument('--encoder_epochs', type=int, default=40)
+    parser.add_argument('--alpha_residual', type=float, default=0.9)
+    parser.add_argument('--output_dir', type=str, default='gan_brats_results')
+    parser.add_argument('--dataset_path', type=str, default='datasets/BraTS2025-GLI-PRE-Challenge-TrainingData')
+    parser.add_argument('--max_normal_to_anomaly_ratio', type=int, default=3)
+    parser.add_argument('--min_tumor_ratio_in_patch', type=float, default=0.05)
+    parser.add_argument('--anomaly_labels', type=int, nargs='+', default=[1, 2, 4])
+    parser.add_argument('-v', '--verbose', action='store_true')
+    args = parser.parse_args()
+
+    config = Config()
+    config.num_subjects = args.num_subjects
+    config.patch_size = args.patch_size
+    config.patches_per_volume = args.patches_per_volume
+    config.batch_size = args.batch_size
+    config.latent_dim = args.latent_dim
+    config.g_learning_rate = args.g_lr
+    config.d_learning_rate = args.d_lr
+    config.e_learning_rate = args.e_lr
+    config.gan_epochs = args.gan_epochs
+    config.encoder_epochs = args.encoder_epochs
+    config.alpha_residual = args.alpha_residual
+    config.output_dir = args.output_dir
+    config.dataset_path = args.dataset_path
+    config.max_normal_to_anomaly_ratio = args.max_normal_to_anomaly_ratio
+    config.min_tumor_ratio_in_patch = args.min_tumor_ratio_in_patch
+    config.anomaly_labels = args.anomaly_labels
+    config.verbose = args.verbose
+    os.makedirs(config.output_dir, exist_ok=True)
+
+    label_names = {0: "Background/Normal", 1: "NCR/NET (Necrotic/Non-enhancing)", 2: "ED (Edema)", 4: "ET (Enhancing Tumor)"}
+    anomaly_names = [f"{label} ({label_names.get(label, 'Unknown')})" for label in config.anomaly_labels] if config.verbose else [f"{l}" for l in config.anomaly_labels]
+    if config.verbose:
+        print("="*60)
+        print("3D GENERATIVE (f-AnoGAN) ANOMALY DETECTION FOR BRATS")
+        print("="*60)
+        print(f"Device: {config.device}")
+        print(f"Dataset path: {config.dataset_path}")
+        print(f"Output directory: {config.output_dir}")
+        print(f"Patch size: {config.patch_size}^3  | Batch size: {config.batch_size}")
+        print(f"GAN epochs: {config.gan_epochs} | Encoder epochs: {config.encoder_epochs}")
+        print(f"Anomaly labels: {anomaly_names}")
+        print("="*60)
+        print("\n1. Processing dataset and extracting patches...")
+    else:
+        print(f"3D f-AnoGAN | Anomaly labels: {anomaly_names} | Output: {config.output_dir}")
+
+    processor = BraTSDataProcessor(config)
+    patches, labels, subjects = processor.process_dataset(config.num_subjects)
+    if len(patches) == 0:
+        print("Error: No patches extracted! Check dataset path/structure.")
+        return
+
+    unique_labels, counts = np.unique(labels, return_counts=True)
+    if len(unique_labels) < 2:
+        print("ERROR: Need both normal and anomalous patches for evaluation.")
+        return
+
+    unique_subjects = list(set(subjects))
+    np.random.shuffle(unique_subjects)
+    n_subjects = len(unique_subjects)
+    train_subjects = unique_subjects[:int(0.6 * n_subjects)]
+    val_subjects = unique_subjects[int(0.6 * n_subjects):int(0.8 * n_subjects)]
+    test_subjects = unique_subjects[int(0.8 * n_subjects):]
+
+    train_indices = [i for i, s in enumerate(subjects) if s in train_subjects]
+    val_indices = [i for i, s in enumerate(subjects) if s in val_subjects]
+    test_indices = [i for i, s in enumerate(subjects) if s in test_subjects]
+
+    X_train_all = patches[train_indices]
+    y_train_all = labels[train_indices]
+    X_val_all = patches[val_indices]
+    y_val_all = labels[val_indices]
+    X_test = patches[test_indices]
+    y_test = labels[test_indices]
+
+    train_normal_mask = (y_train_all == 0)
+    val_normal_mask = (y_val_all == 0)
+    X_train_normal = X_train_all[train_normal_mask]
+    y_train_normal = y_train_all[train_normal_mask]
+    X_val_normal = X_val_all[val_normal_mask]
+    y_val_normal = y_val_all[val_normal_mask]
+
+    if config.verbose:
+        print(f"\n=== SUBJECT-LEVEL SPLIT (UNSUPERVISED) ===")
+        print(f"Train NORMAL ONLY: {len(X_train_normal)} from {len(train_subjects)} subjects")
+        print(f"Val NORMAL ONLY:   {len(X_val_normal)} from {len(val_subjects)} subjects")
+        print(f"Test MIXED:        {len(X_test)} from {len(test_subjects)} subjects")
+        print("="*60)
+
+    assert len(set(train_subjects) & set(val_subjects)) == 0
+    assert len(set(train_subjects) & set(test_subjects)) == 0
+    assert len(set(val_subjects) & set(test_subjects)) == 0
+
+    train_dataset = BraTSPatchDataset(X_train_normal, y_train_normal)
+    val_dataset = BraTSPatchDataset(X_val_normal, y_val_normal)
+    test_dataset = BraTSPatchDataset(X_test, y_test)
+
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers)
+
+    if config.verbose:
+        print("\n2. Training GAN on normal patches...")
+    detector = GenerativeAnomalyDetector(config)
+    detector.train_gan(train_loader)
+
+    if config.verbose:
+        print("\n3. Training encoder (f-AnoGAN) on normal patches...")
+    detector.train_encoder(train_loader)
+
+    if config.verbose:
+        print("\n4. Evaluating on test set...")
+    results = detector.evaluate(test_loader, val_loader)
+
+    visualizer = Visualizer(config)
+    visualizer.create_summary_report(results)
+
+    end_time = time.time()
+    total_time = end_time - start_time
+    hours = int(total_time // 3600)
+    minutes = int((total_time % 3600) // 60)
+    seconds = int(total_time % 60)
+    time_parts = []
+    if hours > 0:
+        time_parts.append(f"{hours}h")
+    if minutes > 0:
+        time_parts.append(f"{minutes}m")
+    time_parts.append(f"{seconds}s")
+    time_formatted = " ".join(time_parts)
+
+    results_file = os.path.join(config.output_dir, 'evaluation_results.txt')
+    with open(results_file, 'w') as f:
+        f.write("TRULY UNSUPERVISED 3D Generative (f-AnoGAN) Anomaly Detection Results\n")
+        f.write("="*60 + "\n")
+        f.write("DATA LEAKAGE PREVENTION MEASURES:\n")
+        f.write("- Subject-level data splitting (no patient overlap)\n")
+        f.write("- Threshold determined using ONLY normal validation data\n")
+        f.write("- No test label access during threshold selection\n")
+        f.write("="*60 + "\n")
+        f.write(f"ROC AUC:           {results['roc_auc']:.4f}\n")
+        f.write(f"Average Precision: {results['average_precision']:.4f}\n")
+        f.write(f"Matthews Correlation: {results['mcc']:.4f}\n")
+        f.write(f"Dice Similarity Coeff: {results['dsc']:.4f}\n")
+        f.write(f"Balanced Accuracy: {results['balanced_accuracy']:.4f}\n")
+        f.write(f"F1 Score:          {results['f1_score']:.4f}\n")
+        f.write(f"Precision:         {results['precision']:.4f}\n")
+        f.write(f"Recall:            {results['recall']:.4f}\n")
+        f.write(f"Specificity:       {results['specificity']:.4f}\n")
+        f.write(f"Accuracy:          {results['accuracy']:.4f}\n")
+        f.write("-"*60 + "\n")
+        f.write("Generative quality (D-feature space):\n")
+        f.write(f"  FID_D:           {results['fid_d'] if results['fid_d'] is not None else float('nan'):.4f}\n")
+        f.write(f"  KID_D (MMD^2):   {results['kid_d']:.6f}\n")
+        f.write(f"  Precision:       {results['gen_precision']:.4f}\n")
+        f.write(f"  Recall:          {results['gen_recall']:.4f}\n")
+        f.write(f"Threshold Used:    {results['optimal_threshold']:.6f}\n")
+        f.write("="*60 + "\n")
+        f.write("Configuration:\n")
+        f.write(f"  Patch size: {config.patch_size}\n")
+        f.write(f"  Patches per volume: {config.patches_per_volume}\n")
+        f.write(f"  Latent dimension: {config.latent_dim}\n")
+        f.write(f"  G LR: {config.g_learning_rate}\n")
+        f.write(f"  D LR: {config.d_learning_rate}\n")
+        f.write(f"  E LR: {config.e_learning_rate}\n")
+        f.write(f"  Batch size: {config.batch_size}\n")
+        f.write(f"  GAN epochs: {config.gan_epochs}\n")
+        f.write(f"  Encoder epochs: {config.encoder_epochs}\n")
+        f.write(f"  Training samples: {len(X_train_normal)}\n")
+        f.write(f"  Validation samples: {len(X_val_normal)}\n")
+        f.write(f"  Test samples: {len(X_test)}\n")
+        f.write(f"  Training subjects: {len(train_subjects)}\n")
+        f.write(f"  Validation subjects: {len(val_subjects)}\n")
+        f.write(f"  Test subjects: {len(test_subjects)}\n")
+        f.write(f"  Anomaly labels used: {config.anomaly_labels}\n")
+        f.write(f"  Anomaly label descriptions: {anomaly_names}\n")
+        f.write("="*60 + "\n")
+        f.write("EXECUTION TIME:\n")
+        f.write(f"  Total time: {time_formatted} ({total_time:.1f} seconds)\n")
+
+    if config.verbose:
+        print(f"\nResults saved to: {results_file}")
+        print("\n" + "="*60)
+        print("PIPELINE COMPLETED SUCCESSFULLY!")
+        print("✓ Subject-level splitting, ✓ Unsupervised thresholding, ✓ No test label access")
+        print("="*60)
+        print(f"⏱️  TOTAL EXECUTION TIME: {time_formatted} ({total_time:.1f} seconds)")
+        print("="*60)
+    else:
+        print(f"\nPipeline completed in {time_formatted}. Results saved to: {results_file}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+

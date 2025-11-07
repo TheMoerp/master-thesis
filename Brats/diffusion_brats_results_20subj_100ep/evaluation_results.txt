@@ -1,35 +1,36 @@
-TRULY UNSUPERVISED 3D VQ-VAE Anomaly Detection Results
+TRULY UNSUPERVISED 3D Diffusion (DDPM) Anomaly Detection Results
 ============================================================
 DATA LEAKAGE PREVENTION MEASURES:
 - Subject-level data splitting (no patient overlap)
 - Threshold determined using ONLY normal validation data
 - No test label access during threshold selection
 ============================================================
-ROC AUC:           0.8559
-Average Precision: 0.7746
-Matthews Correlation: 0.5999
-Dice Similarity Coeff: 0.6741
-Balanced Accuracy: 0.7638
-F1 Score:          0.6741
-Precision:         0.8195
-Recall:            0.5725
-Specificity:       0.9551
-Accuracy:          0.8547
-Threshold Used:    0.015669
+ROC AUC:           0.5553
+Average Precision: 0.2839
+Matthews Correlation: -0.0471
+Dice Similarity Coeff: 0.0550
+Balanced Accuracy: 0.4886
+F1 Score:          0.0550
+Precision:         0.1809
+Recall:            0.0324
+Specificity:       0.9448
+Accuracy:          0.6954
+Threshold Used:    23946763.100000
 ============================================================
 Configuration:
   Patch size: 32
   Patches per volume: 50
-  VQ embedding dim: 128
-  Codebook size: 512
-  Commitment beta: 0.25
-  Learning rate: 5e-05
+  DDPM timesteps: 1000
+  LR: 0.0002
   Batch size: 8
-  Number of epochs: 300
+  Epochs: 100
   Training samples: 75000
   Validation samples: 25000
-  Test samples: 34029
+  Test samples: 34539
+  Training subjects: 750
+  Validation subjects: 250
+  Test subjects: 251
   Anomaly labels used: [1, 4]
 ============================================================
 EXECUTION TIME:
-  Total time: 6h 36m 32s (23792.5 seconds)
+  Total time: 17h 22m 15s (62535.4 seconds)
