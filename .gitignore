@@ -11,3 +11,4 @@ anatomix/
 anatomix_ae_results/
 env_packages/
 .venv/
+.DS_Store
