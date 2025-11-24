@@ -1,10 +1,85 @@
 import os
 import glob
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 
 import numpy as np
 import nibabel as nib
 from tqdm import tqdm
+from scipy.ndimage import uniform_filter, zoom, gaussian_filter
+
+
+PERTURBATION_LEVELS = {
+    'weak': {
+        'gaussian_std': 0.02,
+        'motion_blur_size': 3,
+        'low_resolution_scale': 0.85,
+        'bias_field_amplitude': 0.12,
+    },
+    'medium': {
+        'gaussian_std': 0.05,
+        'motion_blur_size': 5,
+        'low_resolution_scale': 0.65,
+        'bias_field_amplitude': 0.22,
+    },
+    'strong': {
+        'gaussian_std': 0.08,
+        'motion_blur_size': 7,
+        'low_resolution_scale': 0.45,
+        'bias_field_amplitude': 0.35,
+    },
+}
+
+
+def _clip_unit(volume: np.ndarray) -> np.ndarray:
+    return np.clip(volume, 0.0, 1.0).astype(np.float32)
+
+
+def _add_gaussian_noise(volume: np.ndarray, std: float, rng: np.random.Generator) -> np.ndarray:
+    noisy = volume + rng.normal(0.0, std, size=volume.shape)
+    return _clip_unit(noisy)
+
+
+def _apply_motion_blur(volume: np.ndarray, kernel_size: int) -> np.ndarray:
+    # Use uniform filter to emulate mild motion blur / defocus blur
+    blurred = uniform_filter(volume, size=kernel_size, mode='nearest')
+    return _clip_unit(blurred)
+
+
+def _simulate_low_resolution(volume: np.ndarray, scale: float) -> np.ndarray:
+    if scale >= 1.0:
+        return volume.astype(np.float32)
+    scale_factors = (scale, scale, scale)
+    low_res = zoom(volume, zoom=scale_factors, order=1)
+    # Restore to original resolution
+    zoom_back = tuple(orig / float(res) for orig, res in zip(volume.shape, low_res.shape))
+    restored = zoom(low_res, zoom=zoom_back, order=1)
+    # Ensure shape consistency (zoom can produce off-by-one sizes)
+    if restored.shape != volume.shape:
+        pad_width = [(0, max(0, o - r)) for r, o in zip(restored.shape, volume.shape)]
+        restored = np.pad(restored, pad_width, mode='edge')
+        slices = tuple(slice(0, o) for o in volume.shape)
+        restored = restored[slices]
+    return _clip_unit(restored)
+
+
+def _apply_bias_field(volume: np.ndarray, amplitude: float, rng: np.random.Generator) -> np.ndarray:
+    # Create a low-frequency multiplicative field
+    coarse_shape = tuple(max(2, s // 8) for s in volume.shape)
+    field = rng.normal(0.0, 1.0, size=coarse_shape)
+    field = gaussian_filter(field, sigma=1.0)
+    zoom_back = tuple(orig / float(res) for orig, res in zip(volume.shape, field.shape))
+    field = zoom(field, zoom=zoom_back, order=3, mode='nearest')
+    if field.shape != volume.shape:
+        pad_width = [(0, max(0, o - r)) for r, o in zip(field.shape, volume.shape)]
+        field = np.pad(field, pad_width, mode='edge')
+        slices = tuple(slice(0, o) for o in volume.shape)
+        field = field[slices]
+    field = field - field.min()
+    denom = field.max() - field.min() + 1e-8
+    field = field / denom
+    field = 1.0 + amplitude * (field - 0.5) * 2.0
+    biased = volume * field
+    return _clip_unit(biased)
 
 
 def _project_root_from_script_dir(script_dir: str) -> str:
@@ -230,6 +305,62 @@ class BraTSPreprocessor:
         labels = [0] * len(all_normal) + [1] * len(all_anom)
         subjects = subj_normal + subj_anom
         return np.array(patches, dtype=np.float32), np.array(labels, dtype=np.int64), subjects
+
+    def generate_test_perturbations(
+        self,
+        patches: np.ndarray,
+        severity: Optional[str] = None,
+        random_seed: Optional[int] = None,
+    ) -> Dict[str, np.ndarray]:
+        """Generate perturbed copies of patches (normals + anomalies) for robustness evaluation.
+
+        Returns a dictionary mapping perturbation type to perturbed patch arrays. Only activates
+        when a supported severity level (weak, medium, strong) is provided. When severity is None
+        or 'none', an empty dictionary is returned.
+        """
+        if patches.size == 0:
+            return {}
+
+        level = severity or self._get('test_perturbation', None)
+        if level is None:
+            return {}
+        level = str(level).lower()
+        if level in ('none', 'off', 'disable', 'disabled'):
+            return {}
+        if level not in PERTURBATION_LEVELS:
+            raise ValueError(f"Unsupported perturbation severity '{level}'. "
+                             f"Choose from {list(PERTURBATION_LEVELS.keys())}.")
+
+        params = PERTURBATION_LEVELS[level]
+        seed = random_seed if random_seed is not None else self._get('test_perturbation_seed', None)
+        rng = np.random.default_rng(seed)
+
+        perturbations = {}
+
+        # Individual perturbations
+        gaussian_set = [_add_gaussian_noise(patch, params['gaussian_std'], rng) for patch in patches]
+        perturbations['gaussian_noise'] = np.stack(gaussian_set, axis=0)
+
+        blur_set = [_apply_motion_blur(patch, params['motion_blur_size']) for patch in patches]
+        perturbations['motion_blur'] = np.stack(blur_set, axis=0)
+
+        low_res_set = [_simulate_low_resolution(patch, params['low_resolution_scale']) for patch in patches]
+        perturbations['low_resolution'] = np.stack(low_res_set, axis=0)
+
+        bias_set = [_apply_bias_field(patch, params['bias_field_amplitude'], rng) for patch in patches]
+        perturbations['bias_field'] = np.stack(bias_set, axis=0)
+
+        # Combined pipeline (applies all in sequence)
+        combined = []
+        for patch in patches:
+            perturbed = _add_gaussian_noise(patch, params['gaussian_std'], rng)
+            perturbed = _apply_motion_blur(perturbed, params['motion_blur_size'])
+            perturbed = _simulate_low_resolution(perturbed, params['low_resolution_scale'])
+            perturbed = _apply_bias_field(perturbed, params['bias_field_amplitude'], rng)
+            combined.append(perturbed)
+        perturbations['combined'] = np.stack(combined, axis=0)
+
+        return {k: v.astype(np.float32) for k, v in perturbations.items()}
 
 # Simple patch quality validator (used by some pipelines for quick sanity checks)
 def validate_patch_quality(patches: np.ndarray, labels: np.ndarray, verbose: bool = False):

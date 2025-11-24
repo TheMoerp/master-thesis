@@ -78,7 +78,7 @@ class Config:
 
         # VQ-VAE specific parameters
         self.codebook_size = 512
-        self.embedding_dim = 256
+        self.embedding_dim = 128
         self.commitment_beta = 0.25
 
         # Training parameters
@@ -164,7 +164,7 @@ class VectorQuantizer(nn.Module):
 
 
 class VQVAE3D(nn.Module):
-    def __init__(self, input_channels: int = 1, embedding_dim: int = 256, codebook_size: int = 512,
+    def __init__(self, input_channels: int = 1, embedding_dim: int = 128, codebook_size: int = 512,
                  commitment_beta: float = 0.25):
         super().__init__()
         self.embedding_dim = embedding_dim

@@ -5,6 +5,7 @@ import argparse
 import random
 import warnings
 import time
+import heapq
 from typing import List, Tuple, Dict, Optional
 
 import numpy as np
@@ -428,6 +429,78 @@ class AnomalyDetector:
         
         return np.array(reconstruction_errors), np.array(true_labels), np.array(latent_features)
     
+    def collect_reconstruction_examples(
+        self,
+        data_loader: DataLoader,
+        num_good: int = 10,
+        num_bad: int = 10
+    ) -> Dict[str, Dict[str, List[Dict]]]:
+        """
+        Collect lowest/highest reconstruction-error samples separately for normal/anomaly labels.
+        Returns structure: {'good': {'normal': [...], 'anomaly': [...]}, 'bad': {...}}
+        """
+        self.model.eval()
+        label_map = {0: 'normal', 1: 'anomaly'}
+        good_heaps = {lbl: [] for lbl in label_map.values()}
+        bad_heaps = {lbl: [] for lbl in label_map.values()}
+        example_counter = 0
+        
+        with torch.no_grad():
+            for data, labels in tqdm(data_loader, desc="Selecting reconstruction examples"):
+                data = data.to(self.config.device)
+                labels = labels.to(self.config.device)
+                
+                with autocast():
+                    recon, _ = self.model(data)
+                
+                diff = data - recon
+                mse = torch.mean(diff ** 2, dim=(1, 2, 3, 4))
+                residual = torch.abs(diff)
+                
+                for i in range(data.size(0)):
+                    error_value = float(mse[i].item())
+                    label_int = int(labels[i].item())
+                    label_key = label_map.get(label_int, 'normal')
+                    sample = {
+                        'error': error_value,
+                        'label': label_int,
+                        'real': data[i:i+1].detach().cpu().numpy(),
+                        'recon': recon[i:i+1].detach().cpu().numpy(),
+                        'residual': residual[i:i+1].detach().cpu().numpy()
+                    }
+                    # Track best (lowest error) per label
+                    good_heap = good_heaps[label_key]
+                    good_entry = (-error_value, example_counter, sample)
+                    if len(good_heap) < num_good:
+                        heapq.heappush(good_heap, good_entry)
+                    else:
+                        if -error_value > good_heap[0][0]:
+                            heapq.heapreplace(good_heap, good_entry)
+                    
+                    # Track worst (highest error) per label
+                    bad_heap = bad_heaps[label_key]
+                    bad_entry = (error_value, example_counter, sample)
+                    if len(bad_heap) < num_bad:
+                        heapq.heappush(bad_heap, bad_entry)
+                    else:
+                        if error_value > bad_heap[0][0]:
+                            heapq.heapreplace(bad_heap, bad_entry)
+                    
+                    example_counter += 1
+        
+        def format_good(heap: List[Tuple[float, int, Dict]]):
+            # Stored as (-error, ...)
+            return [entry[2] for entry in sorted(heap, key=lambda x: x[0], reverse=True)]
+        
+        def format_bad(heap: List[Tuple[float, int, Dict]]):
+            # Stored as (error, ...)
+            return [entry[2] for entry in sorted(heap, key=lambda x: x[0], reverse=True)]
+        
+        return {
+            'good': {lbl: format_good(heap) for lbl, heap in good_heaps.items()},
+            'bad': {lbl: format_bad(heap) for lbl, heap in bad_heaps.items()}
+        }
+    
     def find_unsupervised_threshold(self, val_loader: DataLoader) -> float:
         """Find threshold using ONLY normal validation data (no test label access)"""
         if self.config.verbose:
@@ -509,6 +582,7 @@ class AnomalyDetector:
         
         # STEP 2: Calculate reconstruction errors on test set
         reconstruction_errors, true_labels, latent_features = self.calculate_reconstruction_errors(test_loader)
+        reconstruction_examples = self.collect_reconstruction_examples(test_loader, num_good=10, num_bad=10)
         
         print(f"\nEVALUATION: Truly Unsupervised Anomaly Detection Results")
         print(f"{'='*60}")
@@ -574,6 +648,7 @@ class AnomalyDetector:
             'true_labels': true_labels,
             'predictions': predictions,
             'latent_features': latent_features,
+            'reconstruction_examples': reconstruction_examples,
             'optimal_threshold': optimal_threshold,
             'roc_auc': roc_auc,
             'average_precision': average_precision,
@@ -790,6 +865,90 @@ class Visualizer:
                    dpi=300, bbox_inches='tight')
         plt.close()
     
+    def _get_slice_axis_index(self) -> int:
+        axis = getattr(self.config, 'slice_axis', 'axial')
+        axis = axis.lower() if isinstance(axis, str) else 'axial'
+        axis_map = {
+            'sagittal': 4,  # width axis
+            'coronal': 3,   # height axis
+            'axial': 2      # depth axis
+        }
+        return axis_map.get(axis, 2)
+    
+    def _extract_slice(self, volume: np.ndarray, axis_idx: int, slice_idx: int) -> np.ndarray:
+        if axis_idx == 2:
+            return volume[0, 0, slice_idx, :, :]
+        if axis_idx == 3:
+            return volume[0, 0, :, slice_idx, :]
+        if axis_idx == 4:
+            return volume[0, 0, :, :, slice_idx]
+        # Fallback to axial
+        return volume[0, 0, slice_idx, :, :]
+    
+    def _plot_reconstruction_pairs(
+        self,
+        axes,
+        real: np.ndarray,
+        recon: np.ndarray,
+        axis_idx: int,
+        slice_fracs: List[float]
+    ):
+        axis_size = real.shape[axis_idx]
+        for col, frac in enumerate(slice_fracs):
+            slice_idx = max(0, min(axis_size - 1, int(axis_size * frac)))
+            real_slice = self._extract_slice(real, axis_idx, slice_idx)
+            recon_slice = self._extract_slice(recon, axis_idx, slice_idx)
+            
+            axes[0, col].imshow(real_slice, cmap='gray')
+            axes[0, col].set_title('Input')
+            axes[0, col].axis('off')
+            
+            axes[1, col].imshow(recon_slice, cmap='gray')
+            axes[1, col].set_title('Recon')
+            axes[1, col].axis('off')
+    
+    def save_reconstruction_examples(self, example_sets: Dict[str, Dict[str, List[Dict]]]):
+        """Save slices for good/bad reconstruction quality"""
+        if not example_sets:
+            return
+        
+        axis_idx = self._get_slice_axis_index()
+        slice_fracs = [0.35, 0.5, 0.65]
+        base_dir = os.path.join(self.config.output_dir, 'reconstruction_examples')
+        os.makedirs(base_dir, exist_ok=True)
+        
+        for category in ['good', 'bad']:
+            label_dict = example_sets.get(category, {})
+            if not label_dict:
+                continue
+            
+            for label_key in ['normal', 'anomaly']:
+                samples = label_dict.get(label_key, [])
+                if not samples:
+                    continue
+                
+                category_dir = os.path.join(base_dir, f'{category}_examples', label_key)
+                os.makedirs(category_dir, exist_ok=True)
+                
+                for idx, sample in enumerate(samples, 1):
+                    fig, axes = plt.subplots(2, len(slice_fracs), figsize=(12, 7))
+                    self._plot_reconstruction_pairs(
+                        axes,
+                        sample['real'],
+                        sample['recon'],
+                        axis_idx,
+                        slice_fracs
+                    )
+                    label_text = "Normal" if label_key == 'normal' else "Anomaly"
+                    fig.suptitle(
+                        f"{category.capitalize()} reconstruction #{idx} | {label_text} | MSE: {sample['error']:.6f}",
+                        fontsize=14
+                    )
+                    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+                    output_path = os.path.join(category_dir, f"{category}_{label_key}_{idx:03d}.png")
+                    plt.savefig(output_path, dpi=200, bbox_inches='tight')
+                    plt.close()
+    
     def visualize_3d_patches(self, patches: np.ndarray, labels: np.ndarray, 
                            num_normal: int = 100, num_anomaly: int = 10):
         """Visualize 3D patches by showing multiple slices in separate folder"""
@@ -889,6 +1048,8 @@ class Visualizer:
                                                 results['true_labels'], 
                                                 results['optimal_threshold'])
         self.plot_latent_space_visualization(results['latent_features'], results['true_labels'])
+        if results.get('reconstruction_examples'):
+            self.save_reconstruction_examples(results['reconstruction_examples'])
         
         print(f"\nAll visualizations saved to: {self.config.output_dir}")
 
@@ -1014,16 +1175,62 @@ def main():
         return
     
     # CRITICAL FIX: Subject-level splitting to prevent patient data leakage
-    unique_subjects = list(set(subjects))
+    subject_label_map: Dict[str, set] = {}
+    for subj, label in zip(subjects, labels):
+        subject_label_map.setdefault(subj, set()).add(int(label))
+    unique_subjects = list(subject_label_map.keys())
     if config.verbose:
         print(f"Total unique subjects: {len(unique_subjects)}")
     
-    # Split subjects (not patches) into train/val/test
-    np.random.shuffle(unique_subjects)
+    anomaly_subjects = [subj for subj, lbls in subject_label_map.items() if 1 in lbls]
+    normal_only_subjects = [subj for subj, lbls in subject_label_map.items() if 1 not in lbls]
+    rng = np.random.default_rng(42)
+    rng.shuffle(anomaly_subjects)
+    rng.shuffle(normal_only_subjects)
+    
     n_subjects = len(unique_subjects)
-    train_subjects = unique_subjects[:int(0.6 * n_subjects)]  # 60% for training
-    val_subjects = unique_subjects[int(0.6 * n_subjects):int(0.8 * n_subjects)]  # 20% for validation
-    test_subjects = unique_subjects[int(0.8 * n_subjects):]  # 20% for testing
+    train_target = max(1, int(0.6 * n_subjects))
+    val_target = max(1, int(0.2 * n_subjects))
+    test_target = max(1, n_subjects - train_target - val_target)
+    # Adjust in case rounding pushed sum beyond total
+    if train_target + val_target + test_target > n_subjects:
+        train_target = n_subjects - val_target - test_target
+        train_target = max(train_target, 1)
+    
+    def allocate_subjects(target_count: int, require_anomaly: bool = False):
+        assigned = []
+        needs_anomaly = require_anomaly and target_count > 0
+        if needs_anomaly and anomaly_subjects:
+            assigned.append(anomaly_subjects.pop())
+            needs_anomaly = False
+        while len(assigned) < target_count and (anomaly_subjects or normal_only_subjects):
+            # Prefer whichever group currently larger to keep balance
+            if normal_only_subjects and (len(normal_only_subjects) >= len(anomaly_subjects)):
+                assigned.append(normal_only_subjects.pop())
+            elif anomaly_subjects:
+                assigned.append(anomaly_subjects.pop())
+            else:
+                break
+        return assigned, needs_anomaly
+    
+    val_subjects, val_missing_anom = allocate_subjects(val_target, require_anomaly=True)
+    test_subjects, test_missing_anom = allocate_subjects(test_target, require_anomaly=True)
+    
+    if val_missing_anom and config.verbose:
+        print("WARNING: Not enough anomaly subjects to include in validation split.")
+    if test_missing_anom and config.verbose:
+        print("WARNING: Not enough anomaly subjects to include in test split.")
+    
+    remaining_subjects = anomaly_subjects + normal_only_subjects
+    rng.shuffle(remaining_subjects)
+    train_subjects = remaining_subjects
+    
+    # Ensure at least one subject per split
+    if not train_subjects:
+        # Steal from validation or test if possible
+        donor = val_subjects if len(val_subjects) > len(test_subjects) else test_subjects
+        if donor:
+            train_subjects.append(donor.pop())
     
     if config.verbose:
         print(f"Subject distribution:")

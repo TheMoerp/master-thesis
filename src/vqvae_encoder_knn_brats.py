@@ -18,7 +18,10 @@ from torch.utils.data import Dataset, DataLoader
 from contextlib import nullcontext
 
 from sklearn.metrics import (
-    roc_curve, precision_recall_curve, auc as sk_auc
+    roc_curve,
+    precision_recall_curve,
+    auc as sk_auc,
+    confusion_matrix,
 )
 import common.brats_preprocessing as br_prep
 from common.brats_preprocessing import BraTSPreprocessor, create_unique_results_dir

@@ -93,6 +93,9 @@ class Config:
         # Anomaly score blend
         self.alpha_residual = 0.9  # residual weight; (1-alpha) for feature loss
 
+        # Anomaly scoring mode: 'reconstruction' (default f-AnoGAN) or 'discriminator'
+        self.anomaly_mode = 'reconstruction'
+
         # Device
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -209,6 +212,7 @@ class GenerativeAnomalyDetector:
     def __init__(self, config: Config):
         self.config = config
         self.device = config.device
+        self.anomaly_mode = config.anomaly_mode
         self.G = Generator3D(config.latent_dim).to(self.device)
         self.D = Discriminator3D().to(self.device)
         self.E = Encoder3D(config.latent_dim).to(self.device)
@@ -311,18 +315,26 @@ class GenerativeAnomalyDetector:
 
     @torch.no_grad()
     def compute_anomaly_scores(self, data_loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
-        self.G.eval(); self.D.eval(); self.E.eval()
-        alpha = self.config.alpha_residual
+        self.G.eval()
+        self.D.eval()
+        if self.anomaly_mode == 'reconstruction':
+            self.E.eval()
+            alpha = self.config.alpha_residual
         scores, labels = [], []
         for real, y in tqdm(data_loader, desc="Scoring"):
             real = real.to(self.device)
-            z = self.E(real)
-            recon = self.G(z)
-            residual = torch.mean((real - recon) ** 2, dim=(1, 2, 3, 4))
-            _, feats_real = self.D(real, return_features=True)
-            _, feats_fake = self.D(recon, return_features=True)
-            feat = torch.mean(torch.abs(feats_real - feats_fake), dim=(1, 2, 3, 4))
-            score = alpha * residual + (1 - alpha) * feat
+            if self.anomaly_mode == 'discriminator':
+                logits = self.D(real).view(-1)
+                probs = torch.sigmoid(logits)
+                score = 1.0 - probs
+            else:
+                z = self.E(real)
+                recon = self.G(z)
+                residual = torch.mean((real - recon) ** 2, dim=(1, 2, 3, 4))
+                _, feats_real = self.D(real, return_features=True)
+                _, feats_fake = self.D(recon, return_features=True)
+                feat = torch.mean(torch.abs(feats_real - feats_fake), dim=(1, 2, 3, 4))
+                score = alpha * residual + (1 - alpha) * feat
             scores.extend(score.detach().cpu().numpy())
             labels.extend(y.cpu().numpy().flatten())
         return np.array(scores), np.array(labels)
@@ -348,7 +360,7 @@ class GenerativeAnomalyDetector:
             self.G.load_state_dict(torch.load(g_path, map_location=self.device))
         if os.path.exists(d_path):
             self.D.load_state_dict(torch.load(d_path, map_location=self.device))
-        if os.path.exists(e_path):
+        if self.anomaly_mode == 'reconstruction' and os.path.exists(e_path):
             self.E.load_state_dict(torch.load(e_path, map_location=self.device))
 
         optimal_threshold = self.find_unsupervised_threshold(val_loader)
@@ -385,6 +397,7 @@ class GenerativeAnomalyDetector:
         fnr = fn / (fn + tp) if (fn + tp) > 0 else 0
 
         results = {
+            'anomaly_mode': self.anomaly_mode,
             'anomaly_scores': scores,
             'true_labels': true_labels,
             'predictions': preds,
@@ -420,6 +433,8 @@ class GenerativeAnomalyDetector:
 
     @torch.no_grad()
     def compute_latent_features(self, data_loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
+        if self.anomaly_mode != 'reconstruction':
+            return np.zeros((0, self.config.latent_dim), dtype=np.float32), np.zeros((0,), dtype=np.int64)
         self.E.eval()
         latents, labels = [], []
         for real, y in tqdm(data_loader, desc="Latent features"):
@@ -435,6 +450,8 @@ class GenerativeAnomalyDetector:
 
     @torch.no_grad()
     def sample_reconstruction_examples(self, data_loader: DataLoader, max_normal: int = 10, max_anomaly: int = 10) -> Dict[str, np.ndarray]:
+        if self.anomaly_mode != 'reconstruction':
+            return {'real': None, 'recon': None, 'residual': None, 'feat_residual': None, 'labels': None}
         self.G.eval(); self.D.eval(); self.E.eval()
         real_list, recon_list, res_list, feat_res_list, labels_list = [], [], [], [], []
         n_norm, n_anom = 0, 0
@@ -794,6 +811,8 @@ def main():
     parser.add_argument('--max_normal_to_anomaly_ratio', type=int, default=3)
     parser.add_argument('--min_tumor_ratio_in_patch', type=float, default=0.05)
     parser.add_argument('--anomaly_labels', type=int, nargs='+', default=[1, 2, 4])
+    parser.add_argument('--anomaly_mode', type=str, choices=['reconstruction', 'discriminator'], default='reconstruction',
+                        help="Choose 'reconstruction' for f-AnoGAN residual scoring or 'discriminator' for direct discriminator-based scoring.")
     parser.add_argument('-v', '--verbose', action='store_true')
     args = parser.parse_args()
 
@@ -819,6 +838,7 @@ def main():
     config.min_tumor_ratio_in_patch = args.min_tumor_ratio_in_patch
     config.anomaly_labels = args.anomaly_labels
     config.verbose = args.verbose
+    config.anomaly_mode = args.anomaly_mode
     # Directory already ensured by create_unique_results_dir
 
     label_names = {0: "Background/Normal", 1: "NCR/NET (Necrotic/Non-enhancing)", 2: "ED (Edema)", 4: "ET (Enhancing Tumor)"}
@@ -832,11 +852,12 @@ def main():
         print(f"Output directory: {config.output_dir}")
         print(f"Patch size: {config.patch_size}^3  | Batch size: {config.batch_size}")
         print(f"GAN epochs: {config.gan_epochs} | Encoder epochs: {config.encoder_epochs}")
+        print(f"Anomaly scoring mode: {config.anomaly_mode}")
         print(f"Anomaly labels: {anomaly_names}")
         print("="*60)
         print("\n1. Processing dataset and extracting patches...")
     else:
-        print(f"3D f-AnoGAN | Anomaly labels: {anomaly_names} | Output: {config.output_dir}")
+        print(f"3D f-AnoGAN | Mode: {config.anomaly_mode} | Anomaly labels: {anomaly_names} | Output: {config.output_dir}")
 
     processor = BraTSPreprocessor(config)
     patches, labels, subjects = processor.process_dataset(config.num_subjects)
@@ -898,9 +919,13 @@ def main():
     detector = GenerativeAnomalyDetector(config)
     detector.train_gan(train_loader)
 
-    if config.verbose:
-        print("\n3. Training encoder (f-AnoGAN) on normal patches...")
-    detector.train_encoder(train_loader)
+    if config.anomaly_mode == 'reconstruction':
+        if config.verbose:
+            print("\n3. Training encoder (f-AnoGAN) on normal patches...")
+        detector.train_encoder(train_loader)
+    else:
+        if config.verbose:
+            print("\n3. Skipping encoder training (discriminator-based anomaly scoring selected).")
 
     if config.verbose:
         print("\n4. Evaluating on test set...")
@@ -959,6 +984,7 @@ def main():
         f.write(f"  Batch size: {config.batch_size}\n")
         f.write(f"  GAN epochs: {config.gan_epochs}\n")
         f.write(f"  Encoder epochs: {config.encoder_epochs}\n")
+        f.write(f"  Anomaly mode: {config.anomaly_mode}\n")
         f.write(f"  Training samples: {len(X_train_normal)}\n")
         f.write(f"  Validation samples: {len(X_val_normal)}\n")
         f.write(f"  Test samples: {len(X_test)}\n")
