@@ -1,7 +1,6 @@
 absl-py
 contourpy
 cycler
-faiss-gpu
 filelock
 fonttools
 fsspec

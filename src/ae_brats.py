@@ -45,38 +45,37 @@ class Config:
         self.output_dir = "ae_brats_results"
         
         # Patch extraction parameters
-        self.patch_size = 32  # 32x32x32 patches
-        self.patches_per_volume = 50  # Number of patches to extract per volume
-        self.min_non_zero_ratio = 0.2  # Increased minimum ratio of non-zero voxels in patch
-        self.max_normal_to_anomaly_ratio = 3  # Reduced ratio for better balance
-        self.min_tumor_ratio_in_patch = 0.05  # Increased minimum tumor ratio (5% instead of 1%)
+        self.patch_size = 32
+        self.patches_per_volume = 50
+        self.min_non_zero_ratio = 0.2
+        self.max_normal_to_anomaly_ratio = 3
+        self.min_tumor_ratio_in_patch = 0.05
         
         # Additional patch quality parameters
-        self.min_patch_std = 0.01  # Minimum standard deviation for patch quality
-        self.min_patch_mean = 0.05  # Minimum mean intensity for patch quality
-        self.max_tumor_ratio_normal = 0.01  # Maximum allowed tumor ratio in normal patches
-        self.min_tumor_ratio_anomaly = 0.05  # Minimum required tumor ratio in anomaly patches
-        self.max_normal_patches_per_subject = 100  # Maximum normal patches per subject
-        self.max_anomaly_patches_per_subject = 50  # Maximum anomaly patches per subject
+        self.min_patch_std = 0.01
+        self.min_patch_mean = 0.05
+        self.max_tumor_ratio_normal = 0.01
+        self.min_tumor_ratio_anomaly = 0.05 
+        self.max_normal_patches_per_subject = 100
+        self.max_anomaly_patches_per_subject = 50 
         
         # Segmentation labels for anomaly detection
-        # BraTS segmentation labels: 0=background/normal, 1=NCR/NET, 2=ED, 4=ET
-        self.anomaly_labels = [1, 2, 4]  # Default: all tumor labels are anomalies
+        self.anomaly_labels = [1, 2, 4]
         
         # Brain tissue quality parameters for normal patches
-        self.min_brain_tissue_ratio = 0.3  # Minimum 30% of patch should be brain tissue (not background)
-        self.max_background_intensity = 0.1  # Values below this are considered background/skull
-        self.min_brain_mean_intensity = 0.1  # Minimum mean intensity for brain tissue patches
-        self.max_high_intensity_ratio = 0.7  # Maximum ratio of very bright pixels (avoid skull/CSF)
-        self.high_intensity_threshold = 0.9  # Threshold for "very bright" pixels
-        self.edge_margin = 8  # Minimum distance from volume edges to extract patches
+        self.min_brain_tissue_ratio = 0.3
+        self.max_background_intensity = 0.1
+        self.min_brain_mean_intensity = 0.1
+        self.max_high_intensity_ratio = 0.7
+        self.high_intensity_threshold = 0.9
+        self.edge_margin = 8
         
         # Model parameters
-        self.latent_dim = 256  # Increased latent dimension for better representation
-        self.learning_rate = 5e-5  # Reduced learning rate for more stable training
-        self.batch_size = 8  # Reduced batch size for better gradients with limited data
+        self.latent_dim = 256
+        self.learning_rate = 5e-5
+        self.batch_size = 8
         self.num_epochs = 100
-        self.early_stopping_patience = 20  # Increased patience
+        self.early_stopping_patience = 20
         
         # Training parameters
         self.train_test_split = 0.8
@@ -84,8 +83,8 @@ class Config:
         
         # Visualization parameters
         self.slice_axis = 'axial'  # 'axial', 'coronal', 'sagittal'
-        
-        # Device configuration
+
+
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.num_workers = 4 if torch.cuda.is_available() else 0
 
@@ -106,8 +105,8 @@ class BraTSPatchDataset(Dataset):
         patch = self.patches[idx]
         label = self.labels[idx]
         
-        # Convert to tensor and add channel dimension
-        patch = torch.FloatTensor(patch).unsqueeze(0)  # Add channel dimension
+        # convedt to tensor and add channel dimension
+        patch = torch.FloatTensor(patch).unsqueeze(0)
         label = torch.FloatTensor([label])
         
         if self.transform:
@@ -122,7 +121,7 @@ class Autoencoder3D(nn.Module):
     def __init__(self, input_channels=1, latent_dim=128):
         super(Autoencoder3D, self).__init__()
         
-        # Encoder with residual-like connections
+        # Encoder
         self.encoder_conv1 = nn.Sequential(
             nn.Conv3d(input_channels, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(32),
@@ -131,7 +130,7 @@ class Autoencoder3D(nn.Module):
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True)
         )
-        self.pool1 = nn.MaxPool3d(2)  # 32->16
+        self.pool1 = nn.MaxPool3d(2)
         
         self.encoder_conv2 = nn.Sequential(
             nn.Conv3d(32, 64, kernel_size=3, stride=1, padding=1),
@@ -141,7 +140,7 @@ class Autoencoder3D(nn.Module):
             nn.BatchNorm3d(64),
             nn.ReLU(inplace=True)
         )
-        self.pool2 = nn.MaxPool3d(2)  # 16->8
+        self.pool2 = nn.MaxPool3d(2)
         
         self.encoder_conv3 = nn.Sequential(
             nn.Conv3d(64, 128, kernel_size=3, stride=1, padding=1),
@@ -151,7 +150,7 @@ class Autoencoder3D(nn.Module):
             nn.BatchNorm3d(128),
             nn.ReLU(inplace=True)
         )
-        self.pool3 = nn.MaxPool3d(2)  # 8->4
+        self.pool3 = nn.MaxPool3d(2) 
         
         self.encoder_conv4 = nn.Sequential(
             nn.Conv3d(128, 256, kernel_size=3, stride=1, padding=1),
@@ -161,7 +160,6 @@ class Autoencoder3D(nn.Module):
             nn.BatchNorm3d(256),
             nn.ReLU(inplace=True)
         )
-        # 4 encoder stages total (stop at 4x4x4 spatial resolution)
         
         # Latent space
         self.flatten = nn.Flatten()
@@ -180,10 +178,9 @@ class Autoencoder3D(nn.Module):
             nn.ReLU(inplace=True)
         )
         self.unflatten = nn.Unflatten(1, (256, 4, 4, 4))
-        
-        # Decoder with symmetric depth (matching 4-stage encoder)
-        
-        # Continue existing decoder path
+
+
+        # Decoder
         self.decoder_conv4 = nn.Sequential(
             nn.Conv3d(256, 256, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm3d(256),
@@ -219,11 +216,11 @@ class Autoencoder3D(nn.Module):
             nn.BatchNorm3d(32),
             nn.ReLU(inplace=True),
             nn.Conv3d(32, input_channels, kernel_size=3, stride=1, padding=1),
-            nn.Sigmoid()  # Output in [0,1] range
+            nn.Sigmoid()
         )
         
     def encode(self, x):
-        # Encoder path
+        # Encode
         e1 = self.encoder_conv1(x)
         e1_pool = self.pool1(e1)
         
@@ -235,18 +232,17 @@ class Autoencoder3D(nn.Module):
         
         e4 = self.encoder_conv4(e3_pool)
         
-        # Latent representation
+        # Representation
         flat = self.flatten(e4)
         latent = self.fc_encode(flat)
         
         return latent
     
     def decode(self, latent):
-        # Decode from latent space
         decoded = self.fc_decode(latent)
         unflat = self.unflatten(decoded)
         
-        # Decoder path
+        # Decode
         d4 = self.decoder_conv4(unflat)
         d4_up = self.upsample3(d4)
         
@@ -267,7 +263,7 @@ class Autoencoder3D(nn.Module):
 
 
 class AnomalyDetector:
-    """Main class for training and evaluating the autoencoder"""
+    """Class for training and evaluating the autoencoder"""
     
     def __init__(self, config: Config):
         self.config = config
@@ -275,7 +271,6 @@ class AnomalyDetector:
         self.scaler = GradScaler()
         
     def train(self, train_loader: DataLoader, val_loader: DataLoader):
-        """Train the autoencoder ONLY on normal data for proper anomaly detection"""
         criterion = nn.MSELoss()
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.config.learning_rate)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
@@ -288,13 +283,9 @@ class AnomalyDetector:
         
         total_steps = self.config.num_epochs * len(train_loader)
         
-        if self.config.verbose:
-            print("TRAINING MODE: Autoencoder will be trained ONLY on normal data (unsupervised)")
-            print("Anomalous data will be used ONLY for testing, not training")
-        
         with tqdm(total=total_steps, desc="Training Progress") as pbar:
             for epoch in range(self.config.num_epochs):
-                # Training phase - ONLY on normal data
+
                 self.model.train()
                 train_loss = 0.0
                 normal_samples_processed = 0
@@ -303,10 +294,9 @@ class AnomalyDetector:
                     data = data.to(self.config.device)
                     labels = labels.to(self.config.device)
                     
-                    # CRITICAL FIX: Only use normal samples (label = 0) for training
                     normal_mask = (labels == 0).squeeze()
                     
-                    if normal_mask.sum() == 0:  # Skip if no normal samples in batch
+                    if normal_mask.sum() == 0:
                         pbar.update(1)
                         continue
                     
@@ -334,7 +324,7 @@ class AnomalyDetector:
                 avg_train_loss = train_loss / len(train_loader) if len(train_loader) > 0 else 0
                 train_losses.append(avg_train_loss)
                 
-                # Validation phase - ONLY on normal data
+                # Validation phase
                 self.model.eval()
                 val_loss = 0.0
                 val_normal_samples = 0
@@ -344,7 +334,6 @@ class AnomalyDetector:
                         data = data.to(self.config.device)
                         labels = labels.to(self.config.device)
                         
-                        # Only validate on normal samples
                         normal_mask = (labels == 0).squeeze()
                         
                         if normal_mask.sum() == 0:
@@ -364,13 +353,12 @@ class AnomalyDetector:
                 
                 scheduler.step(avg_val_loss)
                 
-                # Print epoch summary
                 if (epoch + 1) % 10 == 0 and self.config.verbose:
                     print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
                     print(f"Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}")
                     print(f"Normal samples processed: Train={normal_samples_processed}, Val={val_normal_samples}")
                 
-                # Early stopping
+                # Early stop
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     patience_counter = 0
@@ -384,7 +372,7 @@ class AnomalyDetector:
                     break
         
         if self.config.verbose:
-            print(f"\nTraining completed. Model trained on normal data only.")
+            print(f"\nTraining completed.")
             print(f"Best validation loss: {best_val_loss:.6f}")
         
         # Save training history
@@ -420,7 +408,6 @@ class AnomalyDetector:
                 with autocast():
                     reconstructed, latent = self.model(data)
                     
-                # Calculate MSE for each sample
                 mse = torch.mean((data - reconstructed) ** 2, dim=(1, 2, 3, 4))
                 
                 reconstruction_errors.extend(mse.cpu().numpy())
@@ -437,7 +424,7 @@ class AnomalyDetector:
     ) -> Dict[str, Dict[str, List[Dict]]]:
         """
         Collect lowest/highest reconstruction-error samples separately for normal/anomaly labels.
-        Returns structure: {'good': {'normal': [...], 'anomaly': [...]}, 'bad': {...}}
+        returns {'good': {'normal': [...], 'anomaly': [...]}, 'bad': {...}}
         """
         self.model.eval()
         label_map = {0: 'normal', 1: 'anomaly'}
@@ -468,7 +455,7 @@ class AnomalyDetector:
                         'recon': recon[i:i+1].detach().cpu().numpy(),
                         'residual': residual[i:i+1].detach().cpu().numpy()
                     }
-                    # Track best (lowest error) per label
+
                     good_heap = good_heaps[label_key]
                     good_entry = (-error_value, example_counter, sample)
                     if len(good_heap) < num_good:
@@ -477,7 +464,6 @@ class AnomalyDetector:
                         if -error_value > good_heap[0][0]:
                             heapq.heapreplace(good_heap, good_entry)
                     
-                    # Track worst (highest error) per label
                     bad_heap = bad_heaps[label_key]
                     bad_entry = (error_value, example_counter, sample)
                     if len(bad_heap) < num_bad:
@@ -489,11 +475,9 @@ class AnomalyDetector:
                     example_counter += 1
         
         def format_good(heap: List[Tuple[float, int, Dict]]):
-            # Stored as (-error, ...)
             return [entry[2] for entry in sorted(heap, key=lambda x: x[0], reverse=True)]
         
         def format_bad(heap: List[Tuple[float, int, Dict]]):
-            # Stored as (error, ...)
             return [entry[2] for entry in sorted(heap, key=lambda x: x[0], reverse=True)]
         
         return {
@@ -508,7 +492,6 @@ class AnomalyDetector:
             print(f"{'='*60}")
             print("Computing threshold using ONLY normal validation data...")
         
-        # Calculate reconstruction errors on validation set (only normal data)
         self.model.eval()
         normal_val_errors = []
         
@@ -517,7 +500,6 @@ class AnomalyDetector:
                 data = data.to(self.config.device)
                 labels = labels.to(self.config.device)
                 
-                # Only use normal samples (should be all in val set anyway)
                 normal_mask = (labels == 0).squeeze()
                 if normal_mask.sum() == 0:
                     continue
@@ -527,7 +509,6 @@ class AnomalyDetector:
                 with autocast():
                     reconstructed, _ = self.model(normal_data)
                     
-                # Calculate MSE for each sample
                 mse = torch.mean((normal_data - reconstructed) ** 2, dim=(1, 2, 3, 4))
                 normal_val_errors.extend(mse.cpu().numpy())
         
@@ -538,7 +519,6 @@ class AnomalyDetector:
             print(f"Normal validation errors - Mean: {normal_val_errors.mean():.6f}, Std: {normal_val_errors.std():.6f}")
             print(f"Normal validation errors - Min: {normal_val_errors.min():.6f}, Max: {normal_val_errors.max():.6f}")
         
-        # Create unsupervised threshold candidates based ONLY on normal data
         threshold_methods = {
             'percentile_95': np.percentile(normal_val_errors, 95),
             'percentile_97': np.percentile(normal_val_errors, 97),
@@ -556,7 +536,6 @@ class AnomalyDetector:
             for method, threshold in threshold_methods.items():
                 print(f"{method:<20} {threshold:<12.6f}")
         
-        # Use 95th percentile as default (common practice in anomaly detection)
         selected_threshold = threshold_methods['percentile_95']
         selected_method = 'percentile_95'
         
@@ -569,7 +548,6 @@ class AnomalyDetector:
         return selected_threshold
     
     def evaluate(self, test_loader: DataLoader, val_loader: DataLoader) -> Dict:
-        """Evaluate the autoencoder for truly unsupervised anomaly detection"""
         # Load best model
         model_path = os.path.join(self.config.output_dir, 'best_autoencoder_3d.pth')
         if os.path.exists(model_path):
@@ -577,10 +555,8 @@ class AnomalyDetector:
             if self.config.verbose:
                 print("Loaded best model for evaluation")
         
-        # STEP 1: Determine threshold using ONLY normal validation data (no test label access)
         optimal_threshold = self.find_unsupervised_threshold(val_loader)
         
-        # STEP 2: Calculate reconstruction errors on test set
         reconstruction_errors, true_labels, latent_features = self.calculate_reconstruction_errors(test_loader)
         reconstruction_examples = self.collect_reconstruction_examples(test_loader, num_good=10, num_bad=10)
         
@@ -590,7 +566,6 @@ class AnomalyDetector:
         print(f"Normal samples: {np.sum(true_labels == 0)}")
         print(f"Anomalous samples: {np.sum(true_labels == 1)}")
         
-        # STEP 3/4: Shared metrics computation
         eval_res = evaluate_binary_classification(true_labels, reconstruction_errors, optimal_threshold)
         predictions = eval_res['predictions']
         roc_auc = eval_res['roc_auc']
@@ -608,7 +583,6 @@ class AnomalyDetector:
         specificity = 1.0 - fpr
         tn, fp, fn, tp = confusion_matrix(true_labels, predictions).ravel()
         
-        # Analyze reconstruction error distributions POST-HOC (for understanding, not optimization)
         normal_errors = reconstruction_errors[true_labels == 0]
         anomaly_errors = reconstruction_errors[true_labels == 1]
         separation_ratio = anomaly_errors.mean() / normal_errors.mean() if normal_errors.mean() > 0 else 0
@@ -630,13 +604,11 @@ class AnomalyDetector:
         print(f"Threshold Used:           {optimal_threshold:.6f}")
         print(f"{'='*60}")
         
-        # POST-HOC analysis (for understanding only)
         print(f"\nPOST-HOC RECONSTRUCTION ERROR ANALYSIS:")
         print(f"Normal errors    - Mean: {normal_errors.mean():.6f}, Std: {normal_errors.std():.6f}")
         print(f"Anomaly errors   - Mean: {anomaly_errors.mean():.6f}, Std: {anomaly_errors.std():.6f}")
         print(f"Separation ratio - Anomaly/Normal: {separation_ratio:.3f}")
-        
-        # Detailed confusion matrix analysis
+            
         print(f"\nCONFUSION MATRIX ANALYSIS:")
         print(f"True Negatives (Normal correctly identified):      {tn}")
         print(f"False Positives (Normal misclassified as anomaly): {fp}")
@@ -755,7 +727,6 @@ class Visualizer:
                 print(f"Confusion Matrix plot saved to {output_path}")
         except ValueError as e: 
             print(f"ERROR: Could not save confusion matrix plot: {e}")
-            print("Please make sure you have 'plotly' and 'kaleido' installed (`pip install plotly kaleido`).")
     
     def plot_roc_curve(self, true_labels: np.ndarray, reconstruction_errors: np.ndarray):
         """Plot ROC curve"""
@@ -952,11 +923,9 @@ class Visualizer:
     def visualize_3d_patches(self, patches: np.ndarray, labels: np.ndarray, 
                            num_normal: int = 100, num_anomaly: int = 10):
         """Visualize 3D patches by showing multiple slices in separate folder"""
-        # Create patches visualization subdirectory
         patches_dir = os.path.join(self.config.output_dir, 'patches_visualization')
         os.makedirs(patches_dir, exist_ok=True)
-        
-        # Create subdirectories for normal and anomaly patches
+
         normal_dir = os.path.join(patches_dir, 'normal_patches')
         anomaly_dir = os.path.join(patches_dir, 'anomaly_patches')
         os.makedirs(normal_dir, exist_ok=True)
@@ -966,11 +935,9 @@ class Visualizer:
             print(f"Visualizing patches in separate folder: {patches_dir}")
             print(f"Saving {num_normal} normal patches and {num_anomaly} anomaly patches...")
         
-        # Separate patches by label
         normal_indices = np.where(labels == 0)[0]
         anomaly_indices = np.where(labels == 1)[0]
         
-        # Sample normal patches
         if len(normal_indices) > 0:
             selected_normal = np.random.choice(normal_indices, 
                                              size=min(num_normal, len(normal_indices)), 
@@ -1011,20 +978,17 @@ class Visualizer:
             for i, idx in enumerate(tqdm(selected_anomaly, desc="Saving anomaly patches")):
                 patch = patches[idx]
                 
-                # Create subplot for different slice orientations
                 fig, axes = plt.subplots(2, 4, figsize=(16, 8))
                 fig.suptitle(f'Anomaly Patch #{i+1}', fontsize=16, fontweight='bold', color='red')
                 
-                # Show axial slices (z-axis)
                 for j in range(4):
-                    slice_idx = int(patch.shape[2] * (j + 1) / 5)  # Evenly spaced slices
+                    slice_idx = int(patch.shape[2] * (j + 1) / 5) 
                     axes[0, j].imshow(patch[:, :, slice_idx], cmap='gray')
                     axes[0, j].set_title(f'Axial Slice {slice_idx}')
                     axes[0, j].axis('off')
-                
-                # Show coronal slices (y-axis)
+            
                 for j in range(4):
-                    slice_idx = int(patch.shape[1] * (j + 1) / 5)  # Evenly spaced slices
+                    slice_idx = int(patch.shape[1] * (j + 1) / 5) 
                     axes[1, j].imshow(patch[:, slice_idx, :], cmap='gray')
                     axes[1, j].set_title(f'Coronal Slice {slice_idx}')
                     axes[1, j].axis('off')
@@ -1055,8 +1019,6 @@ class Visualizer:
 
 
 def main():
-    """Main function to run the complete pipeline"""
-    # Start timing the entire process
     start_time = time.time()
     
     parser = argparse.ArgumentParser(description='3D Autoencoder Anomaly Detection for BraTS Dataset')
@@ -1096,7 +1058,6 @@ def main():
     # Initialize configuration
     config = Config()
     
-    # Update config with command line arguments
     config.num_subjects = args.num_subjects
     config.patch_size = args.patch_size
     config.patches_per_volume = args.patches_per_volume
@@ -1104,9 +1065,7 @@ def main():
     config.num_epochs = args.num_epochs
     config.learning_rate = args.learning_rate
     config.latent_dim = args.latent_dim
-    # Route all outputs into unique subfolder under ./results
     config.output_dir = create_unique_results_dir('ae_brats')
-    # Resolve dataset path relative to project root if given as relative path
     _script_dir = os.path.dirname(os.path.abspath(__file__))
     _project_root = os.path.dirname(_script_dir) if os.path.basename(_script_dir) == 'src' else _script_dir
     config.dataset_path = args.dataset_path if os.path.isabs(args.dataset_path) else os.path.join(_project_root, args.dataset_path)
@@ -1115,8 +1074,17 @@ def main():
     config.anomaly_labels = args.anomaly_labels
     config.verbose = args.verbose
     
-    # Directory already ensured by create_unique_results_dir
     
+    label_names = {
+        0: "Background/Normal",
+        1: "NCR/NET (Necrotic/Non-enhancing)",
+        2: "ED (Edema)",
+        4: "ET (Enhancing Tumor)"
+    }
+    anomaly_names = [
+        f"{label}: {label_names.get(label, 'Unknown')}" for label in config.anomaly_labels
+    ]
+
     if config.verbose:
         print("="*60)
         print("3D AUTOENCODER ANOMALY DETECTION FOR BRATS DATASET")
@@ -1128,17 +1096,6 @@ def main():
         print(f"Patches per volume: {config.patches_per_volume}")
         print(f"Number of subjects: {config.num_subjects if config.num_subjects else 'All'}")
         
-        # Explain anomaly labels
-        label_names = {0: "Background/Normal", 1: "NCR/NET (Necrotic/Non-enhancing)", 
-                       2: "ED (Edema)", 4: "ET (Enhancing Tumor)"}
-        anomaly_names = [f"{label} ({label_names.get(label, 'Unknown')})" for label in config.anomaly_labels]
-        print(f"Anomaly labels: {anomaly_names}")
-        print("="*60)
-    else:
-        # Minimal output - just essential info
-        label_names = {0: "Background/Normal", 1: "NCR/NET (Necrotic/Non-enhancing)", 
-                       2: "ED (Edema)", 4: "ET (Enhancing Tumor)"}
-        anomaly_names = [f"{label}" for label in config.anomaly_labels]
         print(f"3D Autoencoder Anomaly Detection | Anomaly labels: {anomaly_names} | Output: {config.output_dir}")
     
     # Step 1: Process dataset and extract patches
@@ -1157,12 +1114,11 @@ def main():
         print(f"Normal patches: {np.sum(labels == 0)}")
         print(f"Anomalous patches: {np.sum(labels == 1)}")
         
-        # Step 1.5: Validate patch quality
         validate_patch_quality(patches, labels, verbose=config.verbose)
     
     # Step 2: Split data into train and test sets
     if config.verbose:
-        print("\n2. Subject-level data splitting for truly unsupervised anomaly detection...")
+        print("\n2. Subject-level data splitting")
     
     # Check if we have both classes
     unique_labels, counts = np.unique(labels, return_counts=True)
@@ -1174,7 +1130,6 @@ def main():
         print("Please check your data extraction - you need both normal and anomalous patches.")
         return
     
-    # CRITICAL FIX: Subject-level splitting to prevent patient data leakage
     subject_label_map: Dict[str, set] = {}
     for subj, label in zip(subjects, labels):
         subject_label_map.setdefault(subj, set()).add(int(label))
@@ -1192,7 +1147,6 @@ def main():
     train_target = max(1, int(0.6 * n_subjects))
     val_target = max(1, int(0.2 * n_subjects))
     test_target = max(1, n_subjects - train_target - val_target)
-    # Adjust in case rounding pushed sum beyond total
     if train_target + val_target + test_target > n_subjects:
         train_target = n_subjects - val_target - test_target
         train_target = max(train_target, 1)
@@ -1204,7 +1158,6 @@ def main():
             assigned.append(anomaly_subjects.pop())
             needs_anomaly = False
         while len(assigned) < target_count and (anomaly_subjects or normal_only_subjects):
-            # Prefer whichever group currently larger to keep balance
             if normal_only_subjects and (len(normal_only_subjects) >= len(anomaly_subjects)):
                 assigned.append(normal_only_subjects.pop())
             elif anomaly_subjects:
@@ -1225,7 +1178,6 @@ def main():
     rng.shuffle(remaining_subjects)
     train_subjects = remaining_subjects
     
-    # Ensure at least one subject per split
     if not train_subjects:
         # Steal from validation or test if possible
         donor = val_subjects if len(val_subjects) > len(test_subjects) else test_subjects
@@ -1238,7 +1190,6 @@ def main():
         print(f"  Validation subjects: {len(val_subjects)}")
         print(f"  Test subjects: {len(test_subjects)}")
     
-    # Create patch-level splits based on subject assignment
     train_indices = [i for i, subj in enumerate(subjects) if subj in train_subjects]
     val_indices = [i for i, subj in enumerate(subjects) if subj in val_subjects]
     test_indices = [i for i, subj in enumerate(subjects) if subj in test_subjects]
@@ -1252,7 +1203,6 @@ def main():
     X_test = patches[test_indices]
     y_test = labels[test_indices]
     
-    # UNSUPERVISED CONSTRAINT: Only use NORMAL patches for training and validation
     train_normal_mask = (y_train_all == 0)
     val_normal_mask = (y_val_all == 0)
     
@@ -1261,46 +1211,28 @@ def main():
     
     X_val_normal = X_val_all[val_normal_mask]
     y_val_normal = y_val_all[val_normal_mask]
-    
-    # Test set keeps both normal and anomalous (for evaluation)
-    # This is the only place where we're allowed to have anomalous data
-    
+
     if config.verbose:
         print(f"\n=== SUBJECT-LEVEL UNSUPERVISED ANOMALY DETECTION SPLIT ===")
-        print(f"Training set (NORMAL ONLY): {len(X_train_normal)} patches from {len(train_subjects)} subjects")
+        print(f"Training set: {len(X_train_normal)} patches from {len(train_subjects)} subjects")
         print(f"  Normal: {np.sum(y_train_normal == 0)}, Anomalous: {np.sum(y_train_normal == 1)}")
-        print(f"Validation set (NORMAL ONLY): {len(X_val_normal)} patches from {len(val_subjects)} subjects") 
+        print(f"Validation set: {len(X_val_normal)} patches from {len(val_subjects)} subjects") 
         print(f"  Normal: {np.sum(y_val_normal == 0)}, Anomalous: {np.sum(y_val_normal == 1)}")
-        print(f"Test set (MIXED): {len(X_test)} patches from {len(test_subjects)} subjects")
+        print(f"Test set: {len(X_test)} patches from {len(test_subjects)} subjects")
         print(f"  Normal: {np.sum(y_test == 0)}, Anomalous: {np.sum(y_test == 1)}")
         print(f"========================================================")
     
-    # Verify no subject appears in multiple splits
     assert len(set(train_subjects) & set(val_subjects)) == 0, "Subject overlap between train and validation!"
     assert len(set(train_subjects) & set(test_subjects)) == 0, "Subject overlap between train and test!"
     assert len(set(val_subjects) & set(test_subjects)) == 0, "Subject overlap between validation and test!"
     if config.verbose:
         print("✓ No subject overlap confirmed - data leakage prevented!")
     
-    # Create datasets with the corrected split
-    # Training: Only normal data from training subjects
     train_dataset = BraTSPatchDataset(X_train_normal, y_train_normal)
-    # Validation: Only normal data from validation subjects
     val_dataset = BraTSPatchDataset(X_val_normal, y_val_normal)
-    # Testing: Mixed data (normal + anomalous) from test subjects
     test_dataset = BraTSPatchDataset(X_test, y_test)
     
     # Step 3: Create data loaders
-    if config.verbose:
-        print("\n3. Creating data loaders...")
-        
-        # UPDATED EXPLANATION: For proper unsupervised anomaly detection
-        print(f"\nCORRECTED ANOMALY DETECTION APPROACH:")
-        print(f"✓ Training: ONLY normal data (autoencoder learns normal patterns)")
-        print(f"✓ Validation: ONLY normal data (monitor overfitting on normal data)")  
-        print(f"✓ Testing: MIXED data (evaluate anomaly detection performance)")
-        print(f"✓ Anomaly Detection: High reconstruction error = Anomaly")
-    
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, 
                              shuffle=True, num_workers=config.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, 
@@ -1330,11 +1262,8 @@ def main():
         print("\n7. Visualizing sample patches...")
     visualizer.visualize_3d_patches(X_test, y_test, num_normal=100, num_anomaly=10)
     
-    # Calculate total execution time before saving results
     end_time = time.time()
     total_time = end_time - start_time
-    
-    # Convert time to human-readable format
     hours = int(total_time // 3600)
     minutes = int((total_time % 3600) // 60)
     seconds = int(total_time % 60)
@@ -1350,12 +1279,7 @@ def main():
     # Save results to file
     results_file = os.path.join(config.output_dir, 'evaluation_results.txt')
     with open(results_file, 'w') as f:
-        f.write("TRULY UNSUPERVISED 3D Autoencoder Anomaly Detection Results\n")
-        f.write("="*60 + "\n")
-        f.write("DATA LEAKAGE PREVENTION MEASURES:\n")
-        f.write("- Subject-level data splitting (no patient overlap)\n")
-        f.write("- Threshold determined using ONLY normal validation data\n")
-        f.write("- No test label access during threshold selection\n")
+        f.write("3D Autoencoder Anomaly Detection Results\n")
         f.write("="*60 + "\n")
         f.write(f"ROC AUC:           {results['roc_auc']:.4f}\n")
         f.write(f"Average Precision: {results['average_precision']:.4f}\n")
@@ -1391,15 +1315,9 @@ def main():
     if config.verbose:
         print(f"\nResults saved to: {results_file}")
         print("\n" + "="*60)
-        print("PIPELINE COMPLETED SUCCESSFULLY!")
-        print("✓ Data leakage eliminated through subject-level splitting")
-        print("✓ Truly unsupervised threshold determination")
-        print("✓ No test label access during model development")
-        print("="*60)
-        print(f"⏱️  TOTAL EXECUTION TIME: {time_formatted} ({total_time:.1f} seconds)")
+        print(f"Total execution time: {time_formatted} ({total_time:.1f} seconds)")
         print("="*60)
     else:
-        # Minimal completion message
         print(f"\nPipeline completed in {time_formatted}. Results saved to: {results_file}")
 
 
